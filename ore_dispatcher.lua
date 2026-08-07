@@ -1,6 +1,6 @@
 -- GTNH 2.9 / OpenComputers
 -- GTNH Ore Dispatch Controller
--- Release v0.3.1
+-- Release v0.3.2
 --
 -- 专用成品网架构：
 --
@@ -37,7 +37,7 @@ local component = require("component")
 local os = require("os")
 local term = require("term")
 
-local VERSION = "0.3.1"
+local VERSION = "0.3.2"
 
 local CONFIG_PATH = "/home/ore_dispatch_config.lua"
 local FALLBACK_CONFIG_PATH = "ore_dispatch_config.lua"
@@ -324,19 +324,72 @@ local function resolveStorageBus()
         address = buses[1]
     end
 
-    local bus = requireProxy(address, "Storage Bus")
+    -- GTNH 2.9 下 me_storagebus 与 fluid_interface 一样，
+    -- methods 表中的布尔值表示 direct/indirect，而不是“是否存在”。
+    -- 因此这里只检查 key 是否存在，并统一通过 component.invoke 调用。
+    local methods = component.methods(address)
 
-    if not hasMethod(bus, "getStorageSlotSize") then
-        error("Storage Bus 不提供 getStorageSlotSize()")
+    if not methods then
+        error("无法读取 Storage Bus 方法表: " .. tostring(address))
     end
 
-    if not hasMethod(bus, "getStorageConfiguration") then
-        error("Storage Bus 不提供 getStorageConfiguration()")
+    for _, methodName in ipairs({
+        "getStorageSlotSize",
+        "getStorageConfiguration",
+        "setStorageConfiguration",
+    }) do
+        if methods[methodName] == nil then
+            error("Storage Bus 不提供 " .. methodName .. "()")
+        end
     end
 
-    if not hasMethod(bus, "setStorageConfiguration") then
-        error("Storage Bus 不提供 setStorageConfiguration()")
-    end
+    local bus = {
+        address = address,
+
+        getStorageSlotSize = function(side)
+            return component.invoke(
+                address,
+                "getStorageSlotSize",
+                side
+            )
+        end,
+
+        getStorageConfiguration = function(side, slot)
+            return component.invoke(
+                address,
+                "getStorageConfiguration",
+                side,
+                slot
+            )
+        end,
+
+        setStorageConfiguration = function(side, slot, detail)
+            if detail ~= nil then
+                return component.invoke(
+                    address,
+                    "setStorageConfiguration",
+                    side,
+                    slot,
+                    detail
+                )
+            end
+
+            if slot ~= nil then
+                return component.invoke(
+                    address,
+                    "setStorageConfiguration",
+                    side,
+                    slot
+                )
+            end
+
+            return component.invoke(
+                address,
+                "setStorageConfiguration",
+                side
+            )
+        end,
+    }
 
     local side = CFG.storageSide
 
@@ -486,11 +539,21 @@ local function readTargets()
     for address in component.list("level_maintainer") do
         requesterCount = requesterCount + 1
 
-        local maintainer = component.proxy(address)
+        local methods = component.methods(address)
+
+        if not methods or methods.getSlot == nil then
+            error(
+                "ME 请求器 "
+                .. tostring(address)
+                .. " 不提供 getSlot()"
+            )
+        end
 
         for slot = 1, slotsPerRequester do
             local ok, data = pcall(
-                maintainer.getSlot,
+                component.invoke,
+                address,
+                "getSlot",
                 slot
             )
 

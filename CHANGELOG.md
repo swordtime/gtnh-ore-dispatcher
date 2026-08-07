@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2
+
+### GTNH 2.9 indirect component method 兼容修复
+- 修复 `me_storagebus` 被误判为“不提供 getStorageSlotSize()`”。
+- Storage Bus 的 `getStorageSlotSize` / `getStorageConfiguration` / `setStorageConfiguration` 统一改用 `component.invoke()`。
+- `level_maintainer.getSlot()` 同步改用 `component.invoke()`，避免同类兼容问题。
+- 本地配置与已填写 UUID 无需修改。
+
 ## 0.3.1
 
 ### GTNH 2.9 / OpenComputers 兼容修复

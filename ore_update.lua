@@ -1,4 +1,4 @@
--- GTNH Ore Dispatcher updater v0.3.1
+-- GTNH Ore Dispatcher updater v0.3.2
 -- Repository: https://github.com/swordtime/gtnh-ore-dispatcher
 
 local component = require("component")

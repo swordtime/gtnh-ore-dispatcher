@@ -2,7 +2,7 @@
 
 OpenComputers ore processing dispatcher for **GTNH 2.9**.
 
-当前版本：**0.3.1**
+当前版本：**0.3.2**
 
 仓库：
 
@@ -308,3 +308,34 @@ v0.3.1 修复：
 - 使用 `methods.getItemsInNetwork ~= nil` 判断方法是否存在。
 - 成品网和原矿缓存网的库存调用统一通过 `component.invoke()`。
 - 已填写的 `productMeAddress` / `cacheMeAddress` 不需要修改。
+
+
+---
+
+## v0.3.2 修复
+
+继续修复 GTNH 2.9 / OpenComputers 的 indirect component method 兼容问题。
+
+实机报错：
+
+```text
+Storage Bus 不提供 getStorageSlotSize()
+```
+
+原因与 v0.3.1 的 `fluid_interface` 问题相同：
+
+- `component.methods(address)[method] == false` 仍然表示方法存在；
+- `false` 只是说明该方法属于 indirect call；
+- 不能用 `proxy.method` 的普通 Lua function 类型来验证方法。
+
+v0.3.2 已将以下 Storage Bus API 全部改为 `component.invoke()`：
+
+```text
+getStorageSlotSize
+getStorageConfiguration
+setStorageConfiguration
+```
+
+同时 `level_maintainer.getSlot()` 也改为 `component.invoke()`，避免后续出现相同兼容问题。
+
+已填写的 UUID 和本地配置无需修改。
