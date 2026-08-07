@@ -1,7 +1,7 @@
 -- GTNH Ore Dispatcher manifest
 -- Repository: https://github.com/swordtime/gtnh-ore-dispatcher
 return {
-    version = "0.3.0",
+    version = "0.3.1",
     rawBase = "https://raw.githubusercontent.com/swordtime/gtnh-ore-dispatcher/main/",
     files = {
         -- 程序文件：允许自动升级

@@ -1,6 +1,6 @@
 -- GTNH 2.9 / OpenComputers
 -- GTNH Ore Dispatch Controller
--- Release v0.3.0
+-- Release v0.3.1
 --
 -- 专用成品网架构：
 --
@@ -37,7 +37,7 @@ local component = require("component")
 local os = require("os")
 local term = require("term")
 
-local VERSION = "0.3.0"
+local VERSION = "0.3.1"
 
 local CONFIG_PATH = "/home/ore_dispatch_config.lua"
 local FALLBACK_CONFIG_PATH = "ore_dispatch_config.lua"
@@ -254,10 +254,21 @@ local function hasMethod(proxy, name)
     return proxy and type(proxy[name]) == "function"
 end
 
-local function validateMeProxy(proxy, role)
-    if not hasMethod(proxy, "getItemsInNetwork") then
+local function makeMeAdapter(address, role)
+    -- GTNH 2.9 / OC: component.methods()[method] may be false.
+    -- false means the method exists but is an indirect call; it is NOT absent.
+    local methods = component.methods(address)
+
+    if not methods or methods.getItemsInNetwork == nil then
         error(role .. " 不提供 getItemsInNetwork()")
     end
+
+    return {
+        address = address,
+        getItemsInNetwork = function(...)
+            return component.invoke(address, "getItemsInNetwork", ...)
+        end,
+    }
 end
 
 local function validateConfig()
@@ -401,18 +412,16 @@ local function resolveMeNetworks()
         error("productMeAddress 与 cacheMeAddress 不能相同")
     end
 
-    local productMe = requireProxy(
+    -- Use component.invoke for GTNH 2.9 fluid_interface indirect methods.
+    local productMe = makeMeAdapter(
         productAddress,
         "成品网 ME"
     )
 
-    local cacheMe = requireProxy(
+    local cacheMe = makeMeAdapter(
         cacheAddress,
         "缓存网 ME"
     )
-
-    validateMeProxy(productMe, "成品网 ME")
-    validateMeProxy(cacheMe, "缓存网 ME")
 
     return productMe, cacheMe, {
         productAddress = productAddress,

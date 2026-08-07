@@ -1,4 +1,4 @@
--- GTNH Ore Dispatcher installer v0.3.0
+-- GTNH Ore Dispatcher installer v0.3.1
 -- Repository: https://github.com/swordtime/gtnh-ore-dispatcher
 
 local component = require("component")
@@ -48,7 +48,7 @@ if not component.isAvailable("internet") then
 end
 
 print("==============================================")
-print("GTNH Ore Dispatcher Installer v0.3.0")
+print("GTNH Ore Dispatcher Installer v0.3.1")
 print("Repository: swordtime/gtnh-ore-dispatcher")
 print("==============================================")
 

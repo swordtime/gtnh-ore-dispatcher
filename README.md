@@ -2,7 +2,7 @@
 
 OpenComputers ore processing dispatcher for **GTNH 2.9**.
 
-当前版本：**0.3.0**
+当前版本：**0.3.1**
 
 仓库：
 
@@ -295,3 +295,16 @@ dryRun = false
 ```
 
 进入 LIVE。
+
+
+---
+
+## v0.3.1 修复
+
+GTNH 2.9 实机确认：`component.methods(address).getItemsInNetwork` 可能返回 `false`。在 OpenComputers 中这里的 `false` 表示该方法存在、但属于间接调用方法，并不表示 API 不存在。
+
+v0.3.1 修复：
+
+- 使用 `methods.getItemsInNetwork ~= nil` 判断方法是否存在。
+- 成品网和原矿缓存网的库存调用统一通过 `component.invoke()`。
+- 已填写的 `productMeAddress` / `cacheMeAddress` 不需要修改。

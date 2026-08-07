@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1
+
+### GTNH 2.9 / OpenComputers 兼容修复
+- 修复 `fluid_interface` 间接方法被误判为不存在的问题。
+- 实机验证：`component.methods(address).getItemsInNetwork == false` 时，`component.invoke(address, "getItemsInNetwork", {})` 仍正常返回 table。
+- 成品网与原矿缓存网读取统一通过 `component.invoke()`。
+- 已填写的两个 UUID 无需修改。
+
 ## 0.3.0
 
 ### 架构
