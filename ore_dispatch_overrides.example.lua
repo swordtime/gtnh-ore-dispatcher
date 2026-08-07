@@ -1,4 +1,4 @@
--- GTNH Ore Dispatcher v0.3.2
+-- GTNH Ore Dispatcher v0.3.3
 -- 特殊矿物覆盖配置
 --
 -- 正常材料无需填写：

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.3
+
+### 原矿自动映射修复
+- 修复 `oreEndstoneBarium` 等带宿主岩石前缀的 GTNH OreDictionary 名称导致 `Barium Dust` 无法匹配 `Barium Ore`。
+- 对已确认的矿石 ItemStack 同时建立 OreDictionary key 与 `"<Material> Ore"` label key。
+- 实机案例现在可建立：
+  - `oreEndstoneBarium -> endstonebarium`
+  - `Barium Ore -> barium`
+  - `Barium Dust -> barium`
+- Dashboard 增加原矿别名数量诊断。
+- 不需要修改现有 UUID、本地配置或请求器。
+
 ## 0.3.2
 
 ### GTNH 2.9 indirect component method 兼容修复

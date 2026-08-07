@@ -2,7 +2,7 @@
 
 OpenComputers ore processing dispatcher for **GTNH 2.9**.
 
-当前版本：**0.3.2**
+当前版本：**0.3.3**
 
 仓库：
 
@@ -339,3 +339,60 @@ setStorageConfiguration
 同时 `level_maintainer.getSlot()` 也改为 `component.invoke()`，避免后续出现相同兼容问题。
 
 已填写的 UUID 和本地配置无需修改。
+
+
+---
+
+## v0.3.3 修复
+
+修复 GTNH 宿主岩石 OreDictionary 前缀导致的原矿映射失败。
+
+实机返回：
+
+```lua
+{
+  size = 5568,
+  name = "gregtech:gt.blockores2",
+  damage = 2063,
+  label = "Barium Ore",
+  oreNames = {"oreEndstoneBarium"}
+}
+```
+
+旧版会将：
+
+```text
+oreEndstoneBarium -> EndstoneBarium
+```
+
+而最终产物：
+
+```text
+Barium Dust -> Barium
+```
+
+因此错误得到：
+
+```text
+barium != endstonebarium
+```
+
+并显示“等待原矿”。
+
+v0.3.3 对已经被 OreDictionary 确认为矿石的 ItemStack，
+额外从英文 label 建立纯材料别名：
+
+```text
+Barium Ore -> Barium
+```
+
+于是同一个原矿会同时拥有：
+
+```text
+endstonebarium
+barium
+```
+
+两个索引。最终产物 `Barium Dust` 会通过 `barium` 正确找到它。
+
+此修复不需要修改请求器、UUID 或 overrides。

@@ -1,6 +1,6 @@
 -- GTNH 2.9 / OpenComputers
 -- GTNH Ore Dispatch Controller
--- Release v0.3.2
+-- Release v0.3.3
 --
 -- 专用成品网架构：
 --
@@ -37,7 +37,7 @@ local component = require("component")
 local os = require("os")
 local term = require("term")
 
-local VERSION = "0.3.2"
+local VERSION = "0.3.3"
 
 local CONFIG_PATH = "/home/ore_dispatch_config.lua"
 local FALLBACK_CONFIG_PATH = "ore_dispatch_config.lua"
@@ -748,6 +748,32 @@ local function materialFromLabel(label)
         "label-fallback"
 end
 
+
+-- 原矿的 OreDictionary 在 GTNH 中可能编码宿主岩石：
+--   oreEndstoneBarium
+--   oreNetherrackBarium
+-- 等。
+-- 但实际物品 label 仍可能是 "Barium Ore"。
+-- 因此原矿目录除了 OreDictionary key 之外，还额外用 label
+-- 生成一个“纯材料名”别名，避免 Endstone/Netherrack 等前缀
+-- 破坏 dustBarium <-> ore...Barium 的自动映射。
+local function materialFromRawOreLabel(label)
+    if type(label) ~= "string" then
+        return nil
+    end
+
+    local material = label:match("^(.-) Ore$")
+
+    if not material or material == "" then
+        return nil
+    end
+
+    return
+        normalizeMaterial(material),
+        material,
+        "raw-label-fallback"
+end
+
 -- ============================================================
 -- 原矿缓存扫描
 -- ============================================================
@@ -783,42 +809,93 @@ local function scanRawOreCatalog(cacheMe)
     local catalog = {}
     local stackCount = 0
     local oreStackCount = 0
+    local aliasCount = 0
+
+    local function addAlias(key, material, stack, oreName)
+        if not key or key == "" then
+            return
+        end
+
+        local row = catalog[key]
+
+        if not row then
+            row = {
+                material = material,
+                amount = 0,
+                best = nil,
+                bestAmount = -1,
+                oreName = oreName,
+            }
+
+            catalog[key] = row
+        end
+
+        row.amount = row.amount + (stack.size or 0)
+
+        if (stack.size or 0) > row.bestAmount then
+            row.bestAmount = stack.size or 0
+
+            -- setStorageConfiguration(detail)
+            -- 已由用户实机验证可写入。
+            row.best = stack
+            row.oreName = oreName
+        end
+
+        aliasCount = aliasCount + 1
+    end
 
     for _, stack in ipairs(getAllNetworkItems(cacheMe)) do
         if stack and (stack.size or 0) > 0 then
             stackCount = stackCount + 1
 
+            -- 避免同一 ItemStack 因多个相同别名重复计数。
+            local seenAliases = {}
+            local matchedAsOre = false
+
+            -- 1) 保留 GTNH OreDictionary 原始 key。
+            --    例如 oreEndstoneBarium -> endstonebarium。
             for _, oreName in ipairs(stack.oreNames or {}) do
                 local material = oreName:match("^ore(.+)$")
 
                 if material then
-                    oreStackCount = oreStackCount + 1
+                    matchedAsOre = true
 
                     local key = normalizeMaterial(material)
-                    local row = catalog[key]
 
-                    if not row then
-                        row = {
-                            material = material,
-                            amount = 0,
-                            best = nil,
-                            bestAmount = -1,
-                            oreName = oreName,
-                        }
-
-                        catalog[key] = row
+                    if key and not seenAliases[key] then
+                        seenAliases[key] = true
+                        addAlias(
+                            key,
+                            material,
+                            stack,
+                            oreName
+                        )
                     end
+                end
+            end
 
-                    row.amount = row.amount + (stack.size or 0)
+            -- 2) 对被确认是矿石的 ItemStack，再从 label 建立纯材料别名。
+            --    你的 GTNH 2.9 实机例子：
+            --      oreNames={"oreEndstoneBarium"}
+            --      label="Barium Ore"
+            --    因此额外建立：
+            --      barium -> 该 Barium Ore ItemStack
+            if matchedAsOre then
+                oreStackCount = oreStackCount + 1
 
-                    if (stack.size or 0) > row.bestAmount then
-                        row.bestAmount = stack.size or 0
+                local labelKey,
+                      labelMaterial = materialFromRawOreLabel(
+                          stack.label
+                      )
 
-                        -- setStorageConfiguration(detail)
-                        -- 已由用户实机验证可写入。
-                        row.best = stack
-                        row.oreName = oreName
-                    end
+                if labelKey and not seenAliases[labelKey] then
+                    seenAliases[labelKey] = true
+                    addAlias(
+                        labelKey,
+                        labelMaterial,
+                        stack,
+                        "label:" .. tostring(stack.label)
+                    )
                 end
             end
         end
@@ -827,6 +904,7 @@ local function scanRawOreCatalog(cacheMe)
     return catalog, {
         networkStackCount = stackCount,
         oreStackCount = oreStackCount,
+        rawAliasCount = aliasCount,
     }
 end
 
@@ -1207,9 +1285,10 @@ local function renderUI(states, info)
     else
         print(
             string.format(
-                "缓存扫描: 网络物品栈=%d 原矿匹配=%d | 重复目标=%d",
+                "缓存扫描: 网络物品栈=%d 原矿匹配=%d 别名=%d | 重复目标=%d",
                 info.networkStackCount or 0,
                 info.oreStackCount or 0,
+                info.rawAliasCount or 0,
                 info.duplicateCount or 0
             )
         )
@@ -1369,6 +1448,7 @@ local function main()
 
                 networkStackCount = cacheScanInfo.networkStackCount,
                 oreStackCount = cacheScanInfo.oreStackCount,
+                rawAliasCount = cacheScanInfo.rawAliasCount,
 
                 activeCount = #selected,
                 changes = changes,
