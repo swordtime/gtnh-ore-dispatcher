@@ -1,13 +1,21 @@
--- 仅用于 OreDictionary 自动映射失败的极少数例外。
--- 正常的 Barium / Ruby / Diamond 等不需要写这里。
+-- GTNH Ore Dispatcher v0.3.0
+-- 特殊矿物覆盖配置
 --
--- key 使用“归一化后的材料名”，程序会自动去空格、标点并转小写。
--- 例如 "Nether Quartz" -> "netherquartz"。
+-- 正常材料无需填写：
+--   dustBarium -> Barium -> oreBarium
+--   gemRuby    -> Ruby    -> oreRuby
 --
--- value 是要让 Storage Bus 标记的原矿描述。
--- 最稳妥的是 name + damage；label 只是为了 UI 好看。
+-- key:
+--   归一化材料名（小写、去空格、去标点）
+--
+-- value:
+--   Storage Bus 最终应标记的“原矿”物品描述。
+--
+-- 只有自动映射失败时才添加这里，主程序无需修改。
+
 return {
     -- 示例：
+    --
     -- ["someweirdmaterial"] = {
     --     name = "gregtech:gt.blockores",
     --     damage = 123,
