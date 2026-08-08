@@ -1,8 +1,8 @@
 -- GTNH 2.9 / OpenComputers
 -- GTNH Ore Dispatch Controller
--- Release v0.7.0-rc1 - Dual Bus Overflow
+-- Release v0.7.0-rc2 - Dual Bus Overflow
 --
--- v0.7.0-rc1:
+-- v0.7.0-rc2:
 --   - 双 Storage Bus：PROCESS + OVERFLOW
 --   - TARGET / AUTO 继续使用 PROCESS Bus
 --   - OVERFLOW 使用独立高优先级垃圾 Storage Bus 拦截后续新增
@@ -24,7 +24,7 @@ local computer = require("computer")
 local serialization = require("serialization")
 local filesystem = require("filesystem")
 
-local VERSION = "0.7.0-rc1"
+local VERSION = "0.7.0-rc2"
 
 local CONFIG_PATH = "/home/ore_dispatch_config.lua"
 local FALLBACK_CONFIG_PATH = "ore_dispatch_config.lua"
@@ -1906,6 +1906,20 @@ local function sortCacheForUI(states)
     end)
 end
 
+local function nonTargetSurplusView(states)
+    local visible = {}
+    local totalAmount = 0
+
+    for _, state in ipairs(states or {}) do
+        if not state.target then
+            table.insert(visible, state)
+            totalAmount = totalAmount + (tonumber(state.amount) or 0)
+        end
+    end
+
+    return visible, totalAmount
+end
+
 local function uiInit()
     if UI.initialized then return end
     if not component.isAvailable("gpu") then
@@ -2112,17 +2126,23 @@ local function renderTextFallback(targetStates, surplusStates, info)
     print(string.rep("-", 96))
 
     if UI.page == "cache" then
-        sortCacheForUI(surplusStates)
-        for _, s in ipairs(surplusStates) do
-            print(string.format(
-                "%s %10s  %-8s AUTO %s/%s  OVF %s  %s",
-                fitText(displayMaterialLabel(s.raw), 24),
-                fmtAmount(s.amount),
-                s.effectivePolicy,
-                fmtAmount(s.high), fmtAmount(s.low),
-                s.overflowConfigured and "ON" or "OFF",
-                s.overflowSelected and "溢流拦截" or s.status
-            ))
+        local visibleStates = nonTargetSurplusView(surplusStates)
+        sortCacheForUI(visibleStates)
+
+        if #visibleStates == 0 then
+            print("当前无余矿：已识别原矿全部属于 TARGET，或缓存中没有可管理余矿。")
+        else
+            for _, s in ipairs(visibleStates) do
+                print(string.format(
+                    "%s %10s  %-8s AUTO %s/%s  OVF %s  %s",
+                    fitText(displayMaterialLabel(s.raw), 24),
+                    fmtAmount(s.amount),
+                    s.effectivePolicy,
+                    fmtAmount(s.high), fmtAmount(s.low),
+                    s.overflowConfigured and "ON" or "OFF",
+                    s.overflowSelected and "溢流拦截" or s.status
+                ))
+            end
         end
     else
         sortTargetsForUI(targetStates)
@@ -2258,12 +2278,29 @@ end
 
 local function renderCachePage(states, info)
     local w, h = UI.w, UI.h
+    local visibleStates, visibleTotalAmount =
+        nonTargetSurplusView(states)
+
+    if UI.selectedMaterialKey then
+        local stillVisible = false
+
+        for _, state in ipairs(visibleStates) do
+            if state.key == UI.selectedMaterialKey then
+                stillVisible = true
+                break
+            end
+        end
+
+        if not stillVisible then
+            UI.selectedMaterialKey = nil
+        end
+    end
 
     gpuFill(1, 1, w, h, COLORS.bg)
 
     drawHeader(
-        "矿物缓存管理",
-        "CACHE POLICY  ·  TARGET > AUTO / IGNORE  +  OVERFLOW GUARD  ·  v"
+        "余矿策略管理",
+        "SURPLUS POLICY  ·  NON-TARGET ONLY  ·  AUTO / IGNORE + OVERFLOW GUARD  ·  v"
         .. VERSION
     )
 
@@ -2288,7 +2325,6 @@ local function renderCachePage(states, info)
     drawButton(autoSpec, 3, 6, 14)
     drawButton(overflowSpec, 18, 6, 14)
 
-    local totalAmount = info.totalRawAmount or 0
     local gap = 2
     local cardW = math.max(
         13,
@@ -2299,16 +2335,16 @@ local function renderCachePage(states, info)
 
     drawCard(
         x, 6, cardW,
-        "缓存矿种",
-        info.rawMaterialCount or 0,
+        "余矿矿种",
+        #visibleStates,
         COLORS.amber
     )
     x = x + cardW + gap
 
     drawCard(
         x, 6, cardW,
-        "总缓存",
-        fmtAmount(totalAmount),
+        "余矿总量",
+        fmtAmount(visibleTotalAmount),
         COLORS.green
     )
     x = x + cardW + gap
@@ -2378,7 +2414,7 @@ local function renderCachePage(states, info)
     gpuText(
         5,
         stripY + 1,
-        "加工策略与溢流保护相互独立：AUTO 可与 OVERFLOW 同时启用；TARGET 永远禁止溢流",
+        "这里只管理未被请求器标记的余矿；成为 TARGET 后立即隐藏并禁止溢流，取消 TARGET 后原配置仍保留",
         COLORS.muted,
         COLORS.panel2
     )
@@ -2390,313 +2426,250 @@ local function renderCachePage(states, info)
     local thresholdX = math.floor(w * 0.68)
     local statusX = w - 18
 
-    gpuText(
-        nameX,
-        headerY,
-        "矿物（点击选择）",
-        COLORS.muted,
-        COLORS.bg
-    )
+    gpuText(nameX, headerY, "余矿（点击选择）", COLORS.muted, COLORS.bg)
+    gpuText(amountX, headerY, "缓存量", COLORS.muted, COLORS.bg)
+    gpuText(policyX, headerY, "加工", COLORS.muted, COLORS.bg)
+    gpuText(thresholdX, headerY, "AUTO 启动/停止", COLORS.muted, COLORS.bg)
+    gpuText(statusX, headerY, "状态", COLORS.muted, COLORS.bg)
+    gpuFill(3, headerY + 1, w - 4, 1, COLORS.border)
 
-    gpuText(
-        amountX,
-        headerY,
-        "缓存量",
-        COLORS.muted,
-        COLORS.bg
-    )
-
-    gpuText(
-        policyX,
-        headerY,
-        "加工",
-        COLORS.muted,
-        COLORS.bg
-    )
-
-    gpuText(
-        thresholdX,
-        headerY,
-        "AUTO 启动/停止",
-        COLORS.muted,
-        COLORS.bg
-    )
-
-    gpuText(
-        statusX,
-        headerY,
-        "状态",
-        COLORS.muted,
-        COLORS.bg
-    )
-
-    gpuFill(
-        3,
-        headerY + 1,
-        w - 4,
-        1,
-        COLORS.border
-    )
-
-    sortCacheForUI(states)
+    sortCacheForUI(visibleStates)
     LAST_CONTEXT.surplusByKey = {}
 
     local rowY = headerY + 2
     local rowH = 3
     local maxRows = math.max(
         1,
-        math.floor(
-            (h - rowY - 2 + 1) / rowH
-        )
+        math.floor((h - rowY - 2 + 1) / rowH)
     )
 
     UI.cachePageSize = maxRows
 
-    local maxOffset =
-        math.max(0, #states - maxRows)
+    local maxOffset = math.max(0, #visibleStates - maxRows)
+    UI.cacheOffset = math.max(
+        0,
+        math.min(UI.cacheOffset or 0, maxOffset)
+    )
 
-    UI.cacheOffset =
-        math.max(
-            0,
-            math.min(
-                UI.cacheOffset or 0,
-                maxOffset
-            )
-        )
+    local nameW = math.max(16, amountX - nameX - 2)
 
-    local nameW =
-        math.max(
-            16,
-            amountX - nameX - 2
-        )
-
-    local selectedStillExists = false
-
-    for _, s in ipairs(states) do
+    for _, s in ipairs(visibleStates) do
         LAST_CONTEXT.surplusByKey[s.key] = s
-
-        if s.key == UI.selectedMaterialKey then
-            selectedStillExists = true
-        end
     end
 
     local firstIndex = UI.cacheOffset + 1
-    local lastIndex =
-        math.min(
-            #states,
-            UI.cacheOffset + maxRows
-        )
+    local lastIndex = math.min(
+        #visibleStates,
+        UI.cacheOffset + maxRows
+    )
 
-    for i = firstIndex, lastIndex do
-        local s = states[i]
-        local y =
-            rowY + (i - firstIndex) * rowH
-
-        local selected =
-            s.key == UI.selectedMaterialKey
-
-        local rowBg =
-            selected
-            and COLORS.selected
-            or (
-                (i % 2 == 1)
-                and COLORS.panel
-                or COLORS.panel2
-            )
-
-        local pColor =
-            policyColor(s.effectivePolicy)
-
-        local mainStatus = s.status
-        local mainColor = statusColor(s.status)
-
-        if s.overflowSelected then
-            mainStatus = "溢流拦截中"
-            mainColor = COLORS.amber
-        elseif s.target
-           and s.overflowConfigured
-        then
-            mainStatus = "TARGET保护"
-            mainColor = COLORS.purple
-        end
-
-        gpuFill(
-            3,
-            y,
-            w - 4,
-            2,
-            rowBg
-        )
-
-        gpuFill(
-            3,
-            y,
-            1,
-            2,
-            selected
-                and COLORS.blue
-                or (
-                    s.overflowSelected
-                    and COLORS.amber
-                    or pColor
-                )
-        )
-
-        registerRegion(
-            {
-                id = "select_material",
-                data = s.key
-            },
-            3,
-            y,
-            w - 4,
-            2
-        )
+    if #visibleStates == 0 then
+        local emptyY = rowY + 2
 
         gpuText(
-            nameX + 1,
-            y,
-            fitText(
-                displayMaterialLabel(s.raw),
-                nameW
-            ),
+            5,
+            emptyY,
+            "当前没有需要管理的余矿",
             COLORS.text,
-            rowBg
+            COLORS.bg
         )
 
         gpuText(
-            amountX,
-            y,
-            fmtAmount(s.amount),
-            (
-                s.overflowConfigured
-                and s.amount >= s.overflowHigh
-            )
-                and COLORS.amber
-                or COLORS.text,
-            rowBg
-        )
-
-        gpuText(
-            policyX,
-            y,
-            s.effectivePolicy,
-            pColor,
-            rowBg
-        )
-
-        gpuText(
-            thresholdX,
-            y,
-            fmtAmount(s.high)
-            .. " / "
-            .. fmtAmount(s.low),
-            COLORS.text,
-            rowBg
-        )
-
-        gpuText(
-            statusX,
-            y,
-            fitText(mainStatus, 17),
-            mainColor,
-            rowBg
-        )
-
-        local barRatio = 0
-
-        if s.policy == "AUTO"
-           and s.high > s.low
-        then
-            barRatio =
-                (s.amount - s.low)
-                / (s.high - s.low)
-
-        elseif s.overflowConfigured
-           and s.overflowHigh > s.overflowLow
-        then
-            barRatio =
-                (s.amount - s.overflowLow)
-                / (
-                    s.overflowHigh
-                    - s.overflowLow
-                )
-        end
-
-        drawSolidBar(
-            nameX + 1,
-            y + 1,
-            math.max(10, nameW - 10),
-            barRatio
-        )
-
-        local overflowDetail
-
-        if s.overflowConfigured then
-            overflowDetail =
-                "溢流 "
-                .. fmtAmount(s.overflowHigh)
-                .. " / "
-                .. fmtAmount(s.overflowLow)
-                .. " · "
-                .. s.overflowStatus
-        else
-            overflowDetail = "溢流 OFF"
-        end
-
-        local detail =
-            overflowDetail
-            .. " · variants "
-            .. tostring(
-                s.raw.variantCount or 1
-            )
-            .. (
-                s.legacyVoid
-                and " · 旧VOID已安全迁移为IGNORE"
-                or ""
-            )
-
-        gpuText(
-            amountX,
-            y + 1,
-            fitText(
-                detail,
-                math.max(
-                    10,
-                    statusX - amountX - 2
-                )
-            ),
+            5,
+            emptyY + 2,
+            "已识别原矿全部属于 TARGET，或缓存网当前没有非 TARGET 原矿。",
             COLORS.muted,
-            rowBg
+            COLORS.bg
         )
-    end
 
-    if UI.selectedMaterialKey
-       and not selectedStillExists
-    then
-        UI.selectedMaterialKey = nil
+        gpuText(
+            5,
+            emptyY + 3,
+            "当请求器取消某材料目标，或出现新的伴生矿后，它会自动出现在这里。",
+            COLORS.muted,
+            COLORS.bg
+        )
+    else
+        for i = firstIndex, lastIndex do
+            local s = visibleStates[i]
+            local y = rowY + (i - firstIndex) * rowH
+
+            local selected =
+                s.key == UI.selectedMaterialKey
+
+            local rowBg =
+                selected
+                and COLORS.selected
+                or (
+                    (i % 2 == 1)
+                    and COLORS.panel
+                    or COLORS.panel2
+                )
+
+            local pColor = policyColor(s.effectivePolicy)
+            local mainStatus = s.status
+            local mainColor = statusColor(s.status)
+
+            if s.overflowSelected then
+                mainStatus = "溢流拦截中"
+                mainColor = COLORS.amber
+            end
+
+            gpuFill(3, y, w - 4, 2, rowBg)
+
+            gpuFill(
+                3,
+                y,
+                1,
+                2,
+                selected
+                    and COLORS.blue
+                    or (
+                        s.overflowSelected
+                        and COLORS.amber
+                        or pColor
+                    )
+            )
+
+            registerRegion(
+                {
+                    id = "select_material",
+                    data = s.key
+                },
+                3,
+                y,
+                w - 4,
+                2
+            )
+
+            gpuText(
+                nameX + 1,
+                y,
+                fitText(displayMaterialLabel(s.raw), nameW),
+                COLORS.text,
+                rowBg
+            )
+
+            gpuText(
+                amountX,
+                y,
+                fmtAmount(s.amount),
+                (
+                    s.overflowConfigured
+                    and s.amount >= s.overflowHigh
+                )
+                    and COLORS.amber
+                    or COLORS.text,
+                rowBg
+            )
+
+            gpuText(
+                policyX,
+                y,
+                s.effectivePolicy,
+                pColor,
+                rowBg
+            )
+
+            gpuText(
+                thresholdX,
+                y,
+                fmtAmount(s.high)
+                .. " / "
+                .. fmtAmount(s.low),
+                COLORS.text,
+                rowBg
+            )
+
+            gpuText(
+                statusX,
+                y,
+                fitText(mainStatus, 17),
+                mainColor,
+                rowBg
+            )
+
+            local barRatio = 0
+
+            if s.policy == "AUTO"
+               and s.high > s.low
+            then
+                barRatio =
+                    (s.amount - s.low)
+                    / (s.high - s.low)
+
+            elseif s.overflowConfigured
+               and s.overflowHigh > s.overflowLow
+            then
+                barRatio =
+                    (s.amount - s.overflowLow)
+                    / (s.overflowHigh - s.overflowLow)
+            end
+
+            drawSolidBar(
+                nameX + 1,
+                y + 1,
+                math.max(10, nameW - 10),
+                barRatio
+            )
+
+            local overflowDetail
+
+            if s.overflowConfigured then
+                overflowDetail =
+                    "溢流 "
+                    .. fmtAmount(s.overflowHigh)
+                    .. " / "
+                    .. fmtAmount(s.overflowLow)
+                    .. " · "
+                    .. s.overflowStatus
+            else
+                overflowDetail = "溢流 OFF"
+            end
+
+            local detail =
+                overflowDetail
+                .. " · variants "
+                .. tostring(s.raw.variantCount or 1)
+                .. (
+                    s.legacyVoid
+                    and " · 旧VOID已安全迁移为IGNORE"
+                    or ""
+                )
+
+            gpuText(
+                amountX,
+                y + 1,
+                fitText(
+                    detail,
+                    math.max(10, statusX - amountX - 2)
+                ),
+                COLORS.muted,
+                rowBg
+            )
+        end
     end
 
     local footerY = h
     local leftFooter
 
-    if #states > maxRows then
+    if #visibleStates > maxRows then
         leftFooter = string.format(
-            "矿物 %d-%d / %d · 鼠标滚轮上下浏览",
+            "余矿 %d-%d / %d · 鼠标滚轮上下浏览",
             firstIndex,
             lastIndex,
-            #states
+            #visibleStates
         )
     else
         leftFooter =
-            "OVERFLOW 只拦截后续新增，不主动清理已有库存"
+            "TARGET 不进入本页 · OVERFLOW 只拦截后续新增，不主动清理已有库存"
     end
 
     gpuText(
         3,
         footerY,
         leftFooter,
-        #states > maxRows
+        #visibleStates > maxRows
             and COLORS.amber
             or COLORS.muted,
         COLORS.bg
@@ -2716,8 +2689,7 @@ local function renderCachePage(states, info)
         rightFooter = "溢流保护 PAUSED"
     end
 
-    local rfW =
-        displayWidth(rightFooter)
+    local rfW = displayWidth(rightFooter)
 
     gpuText(
         math.max(3, w - rfW - 2),
@@ -3338,6 +3310,19 @@ local function main()
                 targetStates
             )
 
+        local nonTargetMaterialCount = 0
+        local nonTargetRawAmount = 0
+
+        for _, state in ipairs(surplusStates) do
+            if not state.target then
+                nonTargetMaterialCount =
+                    nonTargetMaterialCount + 1
+                nonTargetRawAmount =
+                    nonTargetRawAmount
+                    + (tonumber(state.amount) or 0)
+            end
+        end
+
         local remaining =
             math.max(
                 0,
@@ -3438,6 +3423,10 @@ local function main()
                     cacheScanInfo.rawMaterialCount,
                 totalRawAmount =
                     cacheScanInfo.totalRawAmount,
+                nonTargetMaterialCount =
+                    nonTargetMaterialCount,
+                nonTargetRawAmount =
+                    nonTargetRawAmount,
 
                 targetActiveCount =
                     #targetSelected,

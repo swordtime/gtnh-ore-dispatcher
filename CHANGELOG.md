@@ -26,3 +26,13 @@
 - Cache page now shows AUTO and OVERFLOW as separate layers.
 - Added global AUTO and OVERFLOW switches.
 - Added `ore-probe-buses`, a read-only Storage Bus discovery command.
+
+
+## 0.7.0-rc2
+
+- 余矿管理 UI 只显示非 TARGET 材料。
+- TARGET 材料仍保留在后台完整扫描数据中，用于调度和安全保护。
+- 余矿矿种与余矿总量不再计入 TARGET 库存。
+- 已选中的余矿如果变成 TARGET，会自动取消选择并从页面消失。
+- TARGET 期间保留原 AUTO / IGNORE / OVERFLOW 用户配置。
+- 取消 TARGET 后材料自动重新出现并恢复原配置。

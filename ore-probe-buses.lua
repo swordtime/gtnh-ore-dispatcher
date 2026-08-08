@@ -1,5 +1,5 @@
 -- GTNH Ore Dispatcher - Storage Bus read-only probe
--- v0.7.0-rc1
+-- v0.7.0-rc2
 -- NEVER writes or clears any filter.
 
 local component = require("component")

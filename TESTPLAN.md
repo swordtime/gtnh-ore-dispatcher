@@ -1,4 +1,4 @@
-# v0.7.0-rc1 实机测试计划
+# v0.7.0-rc2 实机测试计划
 
 ## 0. 不接 OVERFLOW 也能先启动
 
@@ -129,3 +129,26 @@ RC 升为稳定版前至少需要：
 - 高/低阈值滞回正确；
 - TARGET 强制关闭 OVERFLOW；
 - 正常退出会清动态过滤。
+
+
+## RC2 TARGET 隐藏测试
+
+1. 缓存网只有 Barium Ore，且 Barium 已是 TARGET：
+   - 主 TARGET 页显示 Barium；
+   - 余矿页不显示 Barium；
+   - 余矿矿种 = 0；
+   - 余矿总量 = 0。
+
+2. 加入未标记 Lead Ore：
+   - Barium 仍只在 TARGET 页；
+   - Lead 出现在余矿页；
+   - 余矿统计只包含 Lead。
+
+3. Lead 已配置 AUTO / OVERFLOW 后再成为 TARGET：
+   - 下一轮立即从余矿页隐藏；
+   - OVERFLOW 动态过滤同轮移除；
+   - 用户配置不得删除。
+
+4. 再取消 Lead TARGET：
+   - Lead 自动重新出现；
+   - 原加工策略与溢流阈值仍在。

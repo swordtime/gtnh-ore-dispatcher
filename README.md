@@ -1,4 +1,4 @@
-GTNH Ore Dispatch Controller v0.7.0-rc1
+GTNH Ore Dispatch Controller v0.7.0-rc2
 =================================================
 
 定位
@@ -133,3 +133,16 @@ v0.7 不会把旧 VOID 自动变成活跃销毁。
 2. OC 突然断电时，已经写在 OVERFLOW Bus 上的动态过滤不会被软件主动清掉。
    正常点击退出、程序捕获到错误时会尽力清空动态过滤。
 3. 本版没有主动 PURGE 旧库存功能。
+
+
+RC2：TARGET 从余矿页隐藏
+-----------------------
+底层仍扫描全部原矿，因为 TARGET 保护、OreDictionary 映射与 OVERFLOW 清理都需要完整数据。
+
+但“余矿策略管理”页面只显示非 TARGET：
+
+- 成为 TARGET：立即从余矿页面隐藏；
+- TARGET 期间：OVERFLOW 强制关闭；
+- 原有 AUTO / IGNORE / OVERFLOW 配置继续保留；
+- 请求器取消 TARGET：材料自动重新出现在余矿页面；
+- “余矿矿种 / 余矿总量”只统计非 TARGET 原矿。

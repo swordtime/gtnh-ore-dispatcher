@@ -1,4 +1,4 @@
--- GTNH Ore Dispatch Controller v0.7.0-rc1
+-- GTNH Ore Dispatch Controller v0.7.0-rc2
 -- 用户策略文件。实际文件：/home/ore_dispatch_user.lua
 -- updater 永远不覆盖实际用户文件。
 
