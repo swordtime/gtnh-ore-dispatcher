@@ -1,117 +1,135 @@
-GTNH Ore Dispatch Controller v0.6.1-stable
+GTNH Ore Dispatch Controller v0.7.0-rc1
 =================================================
 
 定位
 ----
-对 v0.6.0 Cache Policy 原型做稳定化，不继续堆新功能。
+本版把 v0.6 的“后台余矿加工”扩展成双 Storage Bus 架构：
 
-策略
+1. PROCESS Bus
+   TARGET / AUTO 使用，送矿处。
+
+2. OVERFLOW Bus
+   专门贴垃圾桶/无限销毁库存。
+   达到上限后，只拦截后续新进入 AE 的匹配原矿。
+   不主动清理已经存下来的旧库存。
+
+为什么不再把“销毁”做成单一 VOID
+-------------------------------
+主动从 AE 中把几亿旧库存抽出来再丢弃，需要 Export Bus 长时间搬运，
+吞吐、能耗和控制复杂度都更高。
+
+OVERFLOW 更像真正的“溢流口”：
+- 正常库存保留；
+- 达到上限后，后续新增直接丢弃；
+- 如果正常消耗让库存降到恢复线，自动停止丢弃。
+
+策略现在是“两层”而不是单一枚举
+-------------------------------
+第一层：后台加工
+- TARGET：请求器需求，绝对最高优先级。
+- AUTO：达到高阈值后送矿处，一直加工到低阈值。
+- IGNORE：不做后台加工。
+
+第二层：OVERFLOW
+- 可独立于 AUTO / IGNORE 开启。
+- TARGET 永远覆盖 OVERFLOW，任何 TARGET 原矿绝不进入垃圾总线。
+- AUTO + OVERFLOW 可以同时配置：
+  AUTO 负责正常消化，OVERFLOW 只作为极端爆仓保险。
+
+示例
 ----
-TARGET > AUTO > IGNORE / VOID
+Lead:
+  AUTO 100M -> 10M
+  OVERFLOW 500M / 450M
 
-TARGET：请求器明确需要的最终产物，最高优先级。
+含义：
+- 100M 以上优先利用空闲矿处加工；
+- 如果矿处长期跟不上，缓存甚至涨到 500M，
+  后续新铅矿直接走垃圾总线；
+- 已有 500M 不会被主动清空；
+- 正常消耗让库存降到 450M 后，垃圾总线解除铅矿过滤。
 
-AUTO：未设置 TARGET 的伴生矿统一余矿处理。
-默认 100M -> 10M：
-- >=100M 启动；
-- 10M~100M 保持上一状态；
-- <=10M 停止。
-draining 状态写入 /home/ore_dispatch_state.lua，重启后继续排到低阈值。
+Lepidolite:
+  IGNORE
+  OVERFLOW 100M / 80M
 
-IGNORE：不自动处理。
+含义：
+- 不浪费矿处吞吐；
+- 前约 100M 正常保留；
+- 之后新增直接丢弃；
+- 如果未来真正消耗到 80M，重新允许储存。
 
-VOID：必须逐矿显式设置；本版仍不会真实销毁。
-
-为什么 AUTO 用 OC
------------------
-AE 的 Level Emitter + Export Bus 很适合“一个确定物品”的阈值控制，
-但每一种矿都要手工配置物品和阈值。
-
-OC 可以：
-- 扫描缓存网全部 oreXxx；
-- 自动识别 TARGET / 非 TARGET；
-- 对未标记材料统一应用 AUTO；
-- TARGET 先抢槽，AUTO 只吃剩余槽；
-- 单矿随时切换 AUTO / IGNORE / VOID。
-
-v0.6.1-stable 修复
-------------------
-1. Storage Bus 安全哨兵
-   默认：
-     requireSentinel = true
-     sentinelSlot = -1
-
-   -1 = 最后一格。
-   63 格总线即 GUI 第63格 / API slot 62。
-
-   最后一格放一个绝不会进入原矿缓存网的占位物。
-   LIVE 启动和每轮写白名单前都检查。
-   占位物被误删时程序直接停机，避免零过滤导致全矿放行。
-
-2. 阻塞编辑改为“安全维护锁”
-   v0.6.0 的 io.read() 会冻结控制循环。
-   现在打开命名/策略输入前，会先安全清空受控过滤槽，
-   但哨兵仍保留，因此矿处暂停进料。
-   输入完成后立即重扫并恢复正确白名单。
-
-3. 长列表支持鼠标滚轮
-   主目标页和缓存页都可滚动。
-   footer 显示当前范围，例如：
-     矿物 17-32 / 84
-
-4. 禁止默认 VOID
-   defaultPolicy 即使被写成 VOID，也会安全归一为 AUTO。
-   VOID 必须逐矿显式选择。
-
-过量销毁（VOID）最终方案
-------------------------
-建议单独硬件通道：
-
+硬件
+----
 原矿缓存 AE
-  -> 独立 ME Export Bus
-  -> Trash Can / 明确会 void 的库存
+  |
+  +-- PROCESS Storage Bus -> 矿处
+  |
+  +-- OVERFLOW Storage Bus -> 垃圾桶 / 无限销毁库存
 
-未来真实 VOID 必须满足：
-- 全局销毁总开关默认 OFF；
-- 只能逐矿显式 VOID；
-- TARGET 永远覆盖 VOID；
-- 高阈值开始销毁，低阈值硬保留；
-- 默认最多同时销毁 1 种；
-- 未识别材料永不销毁；
-- 先实测 GTNH 2.9.x me_exportbus API。
+OVERFLOW Storage Bus 必须：
+- AE 优先级高于正常原矿存储；
+- 通过 OC Adapter/网络让当前电脑能看到 `me_storagebus`；
+- 最后一格手工放永久占位符。
 
-本版新增只读命令：
-  ore-probe-export
+最后一格规则
+------------
+对所有 OC 管理的 Storage Bus：
 
-它只打印 me_exportbus UUID 和 methods，不写配置、不导出物品。
+- GUI 最后一格永久保留；
+- OC 永不写、永不清、永不把它算作任务槽；
+- 你手工放占位符即可。
 
-启动
+63 格 Storage Bus：
+- GUI 1~62：最多可动态使用；
+- GUI 63：永久占位符。
+
+兼容旧配置
+----------
+PROCESS 总线仍兼容旧字段：
+
+storageBusAddress
+storageSide
+managedSlots
+
+新字段优先：
+
+processStorageBusAddress
+processStorageSide
+processManagedSlots
+
+OVERFLOW 必须明确配置：
+
+overflowStorageBusAddress
+overflowStorageSide
+overflowManagedSlots
+
+旧 v0.6 的 VOID
+---------------
+v0.6 的 VOID 从未真正销毁物品。
+
+v0.7 不会把旧 VOID 自动变成活跃销毁。
+旧 VOID 会安全迁移为：
+- 后台加工 IGNORE
+- OVERFLOW OFF
+
+必须由用户在 UI 中重新明确开启 OVERFLOW。
+
+命令
 ----
-ore
+启动：
+  ore
 
-更新
-----
-ore-update
+更新：
+  ore-update
 
-只读探测 Export Bus
--------------------
-ore-probe-export
+只读列出所有 Storage Bus：
+  ore-probe-buses
 
-用户文件不会被 updater 覆盖：
-- /home/ore_dispatch_config.lua
-- /home/ore_dispatch_overrides.lua
-- /home/ore_dispatch_user.lua
-- /home/ore_dispatch_state.lua
-
-
-VOID 预留硬门
+当前 RC 限制
 -------------
-用户策略中预留：
-
-```lua
-voidEnabled = false
-maxVoidActive = 1
-```
-
-`voidEnabled` 是未来真实销毁的全局硬开关。
-v0.6.1-stable 尚未接入 Export Bus，因此即使手动改成 true，本版仍不会销毁任何物品。
+1. OVERFLOW Storage Bus -> 垃圾桶 的实际“新物品优先流入并销毁”行为
+   仍需要在你的 GTNH 2.9.x 实机做一次小量测试。
+2. OC 突然断电时，已经写在 OVERFLOW Bus 上的动态过滤不会被软件主动清掉。
+   正常点击退出、程序捕获到错误时会尽力清空动态过滤。
+3. 本版没有主动 PURGE 旧库存功能。

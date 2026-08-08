@@ -1,13 +1,28 @@
 # Changelog
 
-## 0.6.1-stable
+## 0.7.0-rc1
 
-- Stabilized TARGET > AUTO surplus dispatch.
-- Kept default 100M -> 10M hysteresis with persistent drain state.
-- Added mandatory-by-default Storage Bus sentinel fail-safe.
-- Blocking rename/policy prompts now pause ore input safely before `io.read()`.
-- Added mouse-wheel scrolling to target and full-cache pages.
-- Forbidden global/default VOID; destruction must be explicit per material.
-- VOID remains non-destructive until `me_exportbus` is empirically verified in GTNH 2.9.x.
-- Added read-only `ore-probe-export`.
-- Added updater-safe `ore_dispatch_user.example.lua`.
+### Dual Storage Bus architecture
+- Split PROCESS and OVERFLOW into two independently controlled Storage Buses.
+- Added explicit `processStorageBusAddress` and `overflowStorageBusAddress`.
+- Preserved legacy PROCESS fields for backward compatibility.
+- The GUI last slot of every controlled Storage Bus is now a hard reserved slot and is never touched by OC.
+
+### Overflow Guard
+- Replaced the old non-functional VOID concept with an independent OVERFLOW guard.
+- OVERFLOW does not purge existing stock.
+- When a material reaches its overflow high threshold, it is added to the dedicated high-priority trash Storage Bus.
+- It remains active until cached stock falls to the overflow low threshold.
+- TARGET always disables OVERFLOW for the same material.
+- AUTO and OVERFLOW may be enabled simultaneously.
+
+### Safety
+- Global OVERFLOW switch defaults OFF.
+- Per-material OVERFLOW defaults OFF.
+- Legacy v0.6 VOID migrates to IGNORE + OVERFLOW OFF.
+- Clean exit and caught errors best-effort clear dynamic PROCESS and OVERFLOW filters while leaving the reserved last slot untouched.
+
+### UI / tools
+- Cache page now shows AUTO and OVERFLOW as separate layers.
+- Added global AUTO and OVERFLOW switches.
+- Added `ore-probe-buses`, a read-only Storage Bus discovery command.

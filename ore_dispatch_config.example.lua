@@ -1,44 +1,62 @@
 return {
     -- ============================================================
-    -- GTNH Ore Dispatcher v0.6.1-stable
+    -- GTNH Ore Dispatcher v0.7.0-rc1
     -- ============================================================
 
     -- 【必须填写】
     productMeAddress = nil,
     cacheMeAddress = nil,
 
-    -- 留 nil 自动识别
-    storageBusAddress = nil,
-    storageSide = nil,
+    -- ============================================================
+    -- PROCESS Storage Bus
+    -- ============================================================
+    -- 兼容旧配置：
+    -- storageBusAddress / storageSide / managedSlots 仍然有效。
+    --
+    -- 一旦你接入第二根 OVERFLOW Storage Bus，建议明确填 UUID。
+    processStorageBusAddress = nil,
+    processStorageSide = nil,
+    processManagedSlots = 16,
+
+    -- ============================================================
+    -- OVERFLOW Storage Bus
+    -- ============================================================
+    -- 专门贴在垃圾桶/无限吞吐销毁库存上。
+    -- 必须把这根 Storage Bus 的 AE 优先级手工设得高于正常原矿存储。
+    --
+    -- nil = 不启用硬件，只保留 UI/策略。
+    overflowStorageBusAddress = nil,
+    overflowStorageSide = nil,
+    overflowManagedSlots = 16,
+
+    -- ============================================================
+    -- 最后一格硬件约定
+    -- ============================================================
+    -- 对所有由 OC 控制的 Storage Bus：
+    --
+    -- GUI 最后一格永远由你手工放一个占位符。
+    -- OC 永远不会写、清空或把最后一格当任务槽使用。
+    --
+    -- 63 格总线：
+    -- GUI 1~62 = 最多可由 OC 使用
+    -- GUI 63   = 永久保留，占位符
 
     -- 调度
     controlInterval = 3,
     reopenRatio = 0.95,
     stopRatio = 1.00,
     maxActive = 12,
+
+    -- 旧字段兼容。新配置优先使用 processManagedSlots。
     managedSlots = 16,
 
-    -- Storage Bus 安全哨兵：默认最后一格。
-    -- 63 格总线 => API slot 62 / GUI 第63格。
-    -- 这一格必须永久放一个不会出现在原矿缓存网中的占位物。
-    requireSentinel = true,
-    sentinelSlot = -1,
-
-    -- 安全
+    -- 安全测试时保持 true。
     dryRun = true,
 
     -- UI
     enableUI = true,
-
-    -- v0.4 默认尽可能使用 GPU/屏幕最大分辨率。
-    -- 如果你以后发现超大屏刷新开销明显，可改 false。
     uiUseMaxResolution = true,
-
-    -- ratio = 最缺的排最上面
-    -- name  = 按名称排序
     uiSort = "ratio",
-
-    -- 仅供低配/黑白屏 fallback 使用；高级 UI 的绿色条会自动吃满可用宽度。
     progressBarWidth = 24,
 
     -- 请求器

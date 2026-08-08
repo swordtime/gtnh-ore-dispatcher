@@ -1,19 +1,20 @@
 -- GTNH 2.9 / OpenComputers
 -- GTNH Ore Dispatch Controller
--- Release v0.6.1-stable - Cache Policy
+-- Release v0.7.0-rc1 - Dual Bus Overflow
 --
--- v0.6.0:
---   - 全原矿缓存页面（不再只显示请求器目标）
---   - 目标行 / 缓存行可触摸选择
---   - 目标产物与矿物材料均可设置 UI 别名
---   - TARGET > AUTO > IGNORE / VOID(reserved) 策略层
---   - AUTO 余矿采用高低阈值滞回，默认 100M -> 10M
---   - AUTO 运行状态持久化，OC 重启后继续排空到低阈值
---   - TARGET 抢占 AUTO；AUTO 只使用剩余受控槽位
---   - maxSurplusActive 限制后台余矿并发
---   - VOID 仅预留配置/UI，本版本不会执行任何销毁
+-- v0.7.0-rc1:
+--   - 双 Storage Bus：PROCESS + OVERFLOW
+--   - TARGET / AUTO 继续使用 PROCESS Bus
+--   - OVERFLOW 使用独立高优先级垃圾 Storage Bus 拦截后续新增
+--   - AUTO 与 OVERFLOW 改为两层独立策略，可同时启用
+--   - TARGET 永远覆盖并关闭同材料 OVERFLOW
+--   - OVERFLOW 采用独立高/低阈值滞回，默认 100M / 80M
+--   - v0.6 旧 VOID 安全迁移为 IGNORE + OVERFLOW OFF
+--   - 每根受控 Storage Bus 的 GUI 最后一格永久保留，OC 永不触碰
+--   - 正常退出/捕获错误时尽力清空两根总线的动态过滤
+--   - 新增 ore-probe-buses 只读硬件识别工具
 --
--- Existing /home/ore_dispatch_config.lua remains compatible.
+-- Existing /home/ore_dispatch_config.lua remains compatible for PROCESS.
 
 local component = require("component")
 local os = require("os")
@@ -23,7 +24,7 @@ local computer = require("computer")
 local serialization = require("serialization")
 local filesystem = require("filesystem")
 
-local VERSION = "0.6.1-stable"
+local VERSION = "0.7.0-rc1"
 
 local CONFIG_PATH = "/home/ore_dispatch_config.lua"
 local FALLBACK_CONFIG_PATH = "ore_dispatch_config.lua"
@@ -127,28 +128,48 @@ if not CFG then
 end
 
 local DEFAULT_USER = {
+    -- Background processing layer.
     autoSurplusEnabled = false,
     defaultPolicy = "AUTO",
     surplusHigh = 100000000,
     surplusLow = 10000000,
     maxSurplusActive = 4,
 
-    -- VOID 硬门：本版只持久化，不执行真实销毁。
-    voidEnabled = false,
-    maxVoidActive = 1,
+    -- Independent overflow guard.
+    -- This does NOT purge old stock. It only opens the dedicated
+    -- high-priority trash Storage Bus so NEW matching items are discarded.
+    overflowEnabled = false,
+    overflowHigh = 100000000,
+    overflowLow = 80000000,
+    maxOverflowActive = 16,
 
     names = {
         items = {},
         materials = {},
     },
+
+    -- Per-material:
+    -- policy = AUTO / IGNORE
+    -- high / low = AUTO thresholds
+    -- overflow = true / false
+    -- overflowHigh / overflowLow = overflow guard thresholds
     materials = {},
 }
 
 local function normalizePolicy(policy)
     policy = tostring(policy or "AUTO"):upper()
-    if policy == "AUTO" or policy == "IGNORE" or policy == "VOID" then
+
+    if policy == "AUTO" or policy == "IGNORE" then
         return policy
     end
+
+    -- v0.6 compatibility:
+    -- old VOID was never destructive. We migrate it to IGNORE rather than
+    -- silently enabling any kind of destruction in a new release.
+    if policy == "VOID" or policy == "OVERFLOW" then
+        return "IGNORE"
+    end
+
     return "AUTO"
 end
 
@@ -157,44 +178,77 @@ local function normalizeUserConfig(data)
 
     if data.autoSurplusEnabled == nil then
         data.autoSurplusEnabled = DEFAULT_USER.autoSurplusEnabled
-    end
-
-    data.defaultPolicy = normalizePolicy(data.defaultPolicy or DEFAULT_USER.defaultPolicy)
-    -- 安全边界：VOID 绝不能成为“所有未知矿物”的默认策略。
-    -- 销毁策略必须逐矿显式设置。
-    if data.defaultPolicy == "VOID" then
-        data.defaultPolicy = "AUTO"
-    end
-    data.surplusHigh = tonumber(data.surplusHigh) or DEFAULT_USER.surplusHigh
-    data.surplusLow = tonumber(data.surplusLow) or DEFAULT_USER.surplusLow
-    data.maxSurplusActive = tonumber(data.maxSurplusActive) or DEFAULT_USER.maxSurplusActive
-
-    if data.voidEnabled == nil then
-        data.voidEnabled = DEFAULT_USER.voidEnabled
     else
-        data.voidEnabled = data.voidEnabled == true
+        data.autoSurplusEnabled = data.autoSurplusEnabled == true
     end
 
-    data.maxVoidActive = math.floor(
-        tonumber(data.maxVoidActive) or DEFAULT_USER.maxVoidActive
+    if data.overflowEnabled == nil then
+        data.overflowEnabled = DEFAULT_USER.overflowEnabled
+    else
+        data.overflowEnabled = data.overflowEnabled == true
+    end
+
+    data.defaultPolicy = normalizePolicy(
+        data.defaultPolicy or DEFAULT_USER.defaultPolicy
     )
 
-    if data.maxVoidActive < 0 then
-        data.maxVoidActive = 0
-    end
+    data.surplusHigh =
+        tonumber(data.surplusHigh) or DEFAULT_USER.surplusHigh
+    data.surplusLow =
+        tonumber(data.surplusLow) or DEFAULT_USER.surplusLow
+    data.maxSurplusActive = math.floor(
+        tonumber(data.maxSurplusActive)
+        or DEFAULT_USER.maxSurplusActive
+    )
+
+    data.overflowHigh =
+        tonumber(data.overflowHigh) or DEFAULT_USER.overflowHigh
+    data.overflowLow =
+        tonumber(data.overflowLow) or DEFAULT_USER.overflowLow
+    data.maxOverflowActive = math.floor(
+        tonumber(data.maxOverflowActive)
+        or DEFAULT_USER.maxOverflowActive
+    )
 
     if type(data.names) ~= "table" then data.names = {} end
     if type(data.names.items) ~= "table" then data.names.items = {} end
-    if type(data.names.materials) ~= "table" then data.names.materials = {} end
+    if type(data.names.materials) ~= "table" then
+        data.names.materials = {}
+    end
     if type(data.materials) ~= "table" then data.materials = {} end
 
     for key, entry in pairs(data.materials) do
         if type(entry) ~= "table" then
-            data.materials[key] = {policy = normalizePolicy(entry)}
+            entry = {policy = entry}
+            data.materials[key] = entry
+        end
+
+        local oldPolicy = tostring(
+            entry.policy or data.defaultPolicy or "AUTO"
+        ):upper()
+
+        if oldPolicy == "VOID" then
+            -- Preserve safety: do not turn legacy VOID into live overflow.
+            entry.legacyVoid = true
+        end
+
+        entry.policy = normalizePolicy(oldPolicy)
+
+        if entry.high ~= nil then entry.high = tonumber(entry.high) end
+        if entry.low ~= nil then entry.low = tonumber(entry.low) end
+
+        if entry.overflow == nil then
+            entry.overflow = false
         else
-            entry.policy = normalizePolicy(entry.policy or data.defaultPolicy)
-            if entry.high ~= nil then entry.high = tonumber(entry.high) end
-            if entry.low ~= nil then entry.low = tonumber(entry.low) end
+            entry.overflow = entry.overflow == true
+        end
+
+        if entry.overflowHigh ~= nil then
+            entry.overflowHigh = tonumber(entry.overflowHigh)
+        end
+
+        if entry.overflowLow ~= nil then
+            entry.overflowLow = tonumber(entry.overflowLow)
         end
     end
 
@@ -202,12 +256,38 @@ local function normalizeUserConfig(data)
         error("ore_dispatch_user.lua: surplusHigh 必须 > 0")
     end
 
-    if data.surplusLow < 0 or data.surplusLow >= data.surplusHigh then
-        error("ore_dispatch_user.lua: 必须满足 0 <= surplusLow < surplusHigh")
+    if data.surplusLow < 0
+       or data.surplusLow >= data.surplusHigh
+    then
+        error(
+            "ore_dispatch_user.lua: "
+            .. "必须满足 0 <= surplusLow < surplusHigh"
+        )
+    end
+
+    if data.overflowHigh <= 0 then
+        error("ore_dispatch_user.lua: overflowHigh 必须 > 0")
+    end
+
+    if data.overflowLow < 0
+       or data.overflowLow >= data.overflowHigh
+    then
+        error(
+            "ore_dispatch_user.lua: "
+            .. "必须满足 0 <= overflowLow < overflowHigh"
+        )
     end
 
     if data.maxSurplusActive < 0 then
-        error("ore_dispatch_user.lua: maxSurplusActive 必须 >= 0")
+        error(
+            "ore_dispatch_user.lua: maxSurplusActive 必须 >= 0"
+        )
+    end
+
+    if data.maxOverflowActive < 0 then
+        error(
+            "ore_dispatch_user.lua: maxOverflowActive 必须 >= 0"
+        )
     end
 
     return data
@@ -242,13 +322,18 @@ local function saveUserConfig()
     loadedUserPath = USER_PATH
 end
 
-local RUNSTATE = {surplus = {}}
+local RUNSTATE = {surplus = {}, overflow = {}}
 local stateData, stateErr = loadLuaTable(STATE_PATH)
 local startupWarning = nil
 
 if stateData then
     RUNSTATE = stateData
-    if type(RUNSTATE.surplus) ~= "table" then RUNSTATE.surplus = {} end
+    if type(RUNSTATE.surplus) ~= "table" then
+        RUNSTATE.surplus = {}
+    end
+    if type(RUNSTATE.overflow) ~= "table" then
+        RUNSTATE.overflow = {}
+    end
 elseif fileExists(STATE_PATH) then
     startupWarning = "状态文件损坏，已安全重置: " .. tostring(stateErr)
 end
@@ -467,24 +552,14 @@ local function validateConfig()
 end
 
 -- ============================================================
--- Network / Storage Bus
+-- Network / Storage Buses
 -- ============================================================
 
-local function resolveStorageBus()
-    local address = CFG.storageBusAddress
-
-    if not address then
-        local buses = collectAddresses("me_storagebus")
-        if #buses == 0 then error("未检测到 me_storagebus") end
-        if #buses > 1 then
-            error("检测到多个 me_storagebus，请在配置文件填写 storageBusAddress")
-        end
-        address = buses[1]
-    end
-
+local function buildStorageBus(address, role, configuredSide)
     local methods = component.methods(address)
+
     if not methods then
-        error("无法读取 Storage Bus 方法表: " .. tostring(address))
+        error(role .. "：无法读取方法表 " .. tostring(address))
     end
 
     for _, methodName in ipairs({
@@ -493,103 +568,175 @@ local function resolveStorageBus()
         "setStorageConfiguration",
     }) do
         if methods[methodName] == nil then
-            error("Storage Bus 不提供 " .. methodName .. "()")
+            error(role .. " 不提供 " .. methodName .. "()")
         end
     end
 
     local bus = {
         address = address,
+
         getStorageSlotSize = function(side)
-            return component.invoke(address, "getStorageSlotSize", side)
+            return component.invoke(
+                address,
+                "getStorageSlotSize",
+                side
+            )
         end,
+
         getStorageConfiguration = function(side, slot)
-            return component.invoke(address, "getStorageConfiguration", side, slot)
+            return component.invoke(
+                address,
+                "getStorageConfiguration",
+                side,
+                slot
+            )
         end,
+
         setStorageConfiguration = function(side, slot, detail)
             if detail ~= nil then
-                return component.invoke(address, "setStorageConfiguration", side, slot, detail)
+                return component.invoke(
+                    address,
+                    "setStorageConfiguration",
+                    side,
+                    slot,
+                    detail
+                )
             end
-            return component.invoke(address, "setStorageConfiguration", side, slot)
+
+            return component.invoke(
+                address,
+                "setStorageConfiguration",
+                side,
+                slot
+            )
         end,
     }
 
-    local side = CFG.storageSide
+    local side = configuredSide
+
     if side == nil then
         for testSide = 0, 5 do
-            local ok, count = pcall(bus.getStorageSlotSize, testSide)
-            if ok and type(count) == "number" and count > 0 then
+            local ok, count = pcall(
+                bus.getStorageSlotSize,
+                testSide
+            )
+
+            if ok
+               and type(count) == "number"
+               and count > 0
+            then
                 side = testSide
                 break
             end
         end
     end
 
-    if side == nil then error("无法自动识别 Storage Bus side") end
+    if side == nil then
+        error(role .. "：无法自动识别 side")
+    end
 
-    local ok, slotCount = pcall(bus.getStorageSlotSize, side)
-    if not ok then error("Storage Bus side 无效: " .. tostring(side)) end
-    if type(slotCount) ~= "number" or slotCount < 1 then
-        error("Storage Bus 返回的槽位数量异常: " .. tostring(slotCount))
+    local ok, slotCount = pcall(
+        bus.getStorageSlotSize,
+        side
+    )
+
+    if not ok then
+        error(
+            role
+            .. " side 无效: "
+            .. tostring(side)
+        )
+    end
+
+    if type(slotCount) ~= "number"
+       or slotCount < 2
+    then
+        error(
+            role
+            .. " 槽位数异常: "
+            .. tostring(slotCount)
+            .. "；至少需要 2 格，因为最后一格永久保留"
+        )
     end
 
     return bus, side, slotCount, address
 end
 
--- ============================================================
--- Storage Bus 安全哨兵
--- ============================================================
---
--- AE Storage Bus 的过滤槽若全部为空，会退化为“不过滤”。
--- 因此 LIVE 模式必须保留一个不在 managedSlots 范围内的占位过滤项。
--- 默认使用最后一个 API 槽位（例如 63 格总线的 slot=62）。
---
--- 配置：
---   requireSentinel = true   -- 默认 true
---   sentinelSlot = -1        -- -1 / nil = 最后一格
---
-local function resolveSentinelSlot(slotCount, managedSlots)
-    local required = CFG.requireSentinel ~= false
-    if not required then return nil, false end
-
-    local slot = CFG.sentinelSlot
-    if slot == nil or slot == "last" or tonumber(slot) == -1 then
-        slot = slotCount - 1
-    else
-        slot = tonumber(slot)
-    end
-
-    if not slot or slot < 0 or slot >= slotCount then
-        error("sentinelSlot 无效；有效范围 0~" .. tostring(slotCount - 1))
-    end
-
-    if slot < managedSlots then
-        error(
-            "sentinelSlot 必须位于受控槽之外；当前 managedSlots="
-            .. tostring(managedSlots)
-            .. "，sentinelSlot="
-            .. tostring(slot)
-        )
-    end
-
-    return slot, true
+local function storageBusAddressList()
+    local buses = collectAddresses("me_storagebus")
+    table.sort(buses)
+    return buses
 end
 
-local function readSentinel(bus, side, slot)
-    if slot == nil then return true, nil end
+local function resolveProcessStorageBus()
+    local address =
+        CFG.processStorageBusAddress
+        or CFG.storageBusAddress
 
-    local ok, item = pcall(bus.getStorageConfiguration, side, slot)
-    if not ok then
-        return false, "读取安全哨兵槽失败: " .. tostring(item)
+    if not address then
+        local buses = storageBusAddressList()
+
+        if #buses == 0 then
+            error("未检测到 me_storagebus")
+        end
+
+        if #buses > 1 then
+            error(
+                "检测到多个 me_storagebus。"
+                .. "新增 OVERFLOW 总线后必须明确填写 "
+                .. "processStorageBusAddress / "
+                .. "overflowStorageBusAddress。"
+            )
+        end
+
+        address = buses[1]
     end
 
-    if item == nil then
-        return false,
-            "安全哨兵槽为空。请在 Storage Bus GUI 第 "
-            .. tostring(slot + 1)
-            .. " 格放入一个永远不会出现在原矿缓存网中的占位物。"
+    local side = CFG.processStorageSide
+
+    if side == nil then
+        side = CFG.storageSide
     end
 
-    return true, item
+    return buildStorageBus(
+        address,
+        "PROCESS Storage Bus",
+        side
+    )
+end
+
+local function resolveOverflowStorageBus()
+    local address = CFG.overflowStorageBusAddress
+
+    if not address or tostring(address) == "" then
+        return nil, nil, nil, nil
+    end
+
+    return buildStorageBus(
+        address,
+        "OVERFLOW Storage Bus",
+        CFG.overflowStorageSide
+    )
+end
+
+local function managedSlotCount(slotCount, requested, role)
+    -- Hard invariant:
+    -- API slot slotCount-1 == GUI last slot is RESERVED.
+    -- OC never reads it as a task slot, never writes it, never clears it.
+    local maximum = slotCount - 1
+    local count = tonumber(requested)
+
+    if count == nil then
+        count = maximum
+    end
+
+    count = math.floor(count)
+
+    if count < 1 then
+        error(role .. " managedSlots 必须 >= 1")
+    end
+
+    return math.min(count, maximum)
 end
 
 local function resolveMeNetworks()
@@ -1067,29 +1214,81 @@ local function chooseTargetActive(states, slotLimit)
 end
 
 -- ============================================================
--- Cache policy (AUTO / IGNORE / VOID reserved)
+-- Cache policy (AUTO / IGNORE + independent OVERFLOW guard)
 -- ============================================================
 
 local function materialSetting(key)
     local entry = USER.materials[key]
     if type(entry) ~= "table" then entry = {} end
 
-    local policy = normalizePolicy(entry.policy or USER.defaultPolicy)
-    local high = tonumber(entry.high) or tonumber(USER.surplusHigh) or 100000000
-    local low = tonumber(entry.low) or tonumber(USER.surplusLow) or 10000000
+    local policy = normalizePolicy(
+        entry.policy or USER.defaultPolicy
+    )
+
+    local high =
+        tonumber(entry.high)
+        or tonumber(USER.surplusHigh)
+        or 100000000
+
+    local low =
+        tonumber(entry.low)
+        or tonumber(USER.surplusLow)
+        or 10000000
 
     if high <= 0 then high = 100000000 end
     if low < 0 then low = 0 end
-    if low >= high then low = math.max(0, math.floor(high * 0.1)) end
+    if low >= high then
+        low = math.max(0, math.floor(high * 0.1))
+    end
 
-    return entry, policy, high, low
+    local overflowConfigured = entry.overflow == true
+
+    local overflowHigh =
+        tonumber(entry.overflowHigh)
+        or tonumber(USER.overflowHigh)
+        or 100000000
+
+    local overflowLow =
+        tonumber(entry.overflowLow)
+        or tonumber(USER.overflowLow)
+        or 80000000
+
+    if overflowHigh <= 0 then
+        overflowHigh = 100000000
+    end
+
+    if overflowLow < 0 then overflowLow = 0 end
+
+    if overflowLow >= overflowHigh then
+        overflowLow = math.max(
+            0,
+            math.floor(overflowHigh * 0.8)
+        )
+    end
+
+    return entry,
+           policy,
+           high,
+           low,
+           overflowConfigured,
+           overflowHigh,
+           overflowLow
 end
 
 local function displayMaterialLabel(row)
     local alias = USER.names.materials[row.key]
-    if alias and alias ~= "" then return alias end
-    if row.label and row.label ~= "" then return row.label end
-    return tostring(row.material or row.key or "?") .. " Ore"
+
+    if alias and alias ~= "" then
+        return alias
+    end
+
+    if row.label and row.label ~= "" then
+        return row.label
+    end
+
+    return tostring(
+        row.material or row.key or "?"
+    ) .. " Ore"
 end
 
 local function buildTargetCoverage(targetStates)
@@ -1097,7 +1296,10 @@ local function buildTargetCoverage(targetStates)
     local rawItemSet = {}
 
     for _, state in ipairs(targetStates) do
-        if state.materialKey then aliasSet[state.materialKey] = true end
+        if state.materialKey then
+            aliasSet[state.materialKey] = true
+        end
+
         if state.raw and state.raw.best then
             rawItemSet[itemId(state.raw.best)] = true
         end
@@ -1106,77 +1308,176 @@ local function buildTargetCoverage(targetStates)
     return aliasSet, rawItemSet
 end
 
-local function rowIsTarget(row, targetAliases, targetRawItems)
-    if row.best and targetRawItems[itemId(row.best)] then return true end
-    for aliasKey in pairs(row.aliases or {}) do
-        if targetAliases[aliasKey] then return true end
+local function rowIsTarget(
+    row,
+    targetAliases,
+    targetRawItems
+)
+    if row.best
+       and targetRawItems[itemId(row.best)]
+    then
+        return true
     end
+
+    for aliasKey in pairs(row.aliases or {}) do
+        if targetAliases[aliasKey] then
+            return true
+        end
+    end
+
     return false
 end
 
 local function evaluateSurplus(rawRows, targetStates)
-    local targetAliases, targetRawItems = buildTargetCoverage(targetStates)
+    local targetAliases,
+          targetRawItems =
+        buildTargetCoverage(targetStates)
+
     local states = {}
     local stateChanged = false
 
     for key, row in pairs(rawRows) do
-        local _, policy, high, low = materialSetting(key)
-        local isTarget = rowIsTarget(row, targetAliases, targetRawItems)
-        local memory = RUNSTATE.surplus[key]
-        if type(memory) ~= "table" then
-            memory = {draining = false}
-            RUNSTATE.surplus[key] = memory
+        local entry,
+              policy,
+              high,
+              low,
+              overflowConfigured,
+              overflowHigh,
+              overflowLow =
+            materialSetting(key)
+
+        local isTarget =
+            rowIsTarget(
+                row,
+                targetAliases,
+                targetRawItems
+            )
+
+        -- ---------- AUTO processing state ----------
+        local autoMemory = RUNSTATE.surplus[key]
+
+        if type(autoMemory) ~= "table" then
+            autoMemory = {draining = false}
+            RUNSTATE.surplus[key] = autoMemory
         end
 
-        local wasDraining = memory.draining == true
+        local wasDraining =
+            autoMemory.draining == true
+
         local draining = wasDraining
         local status = ""
         local effectivePolicy = policy
 
         if isTarget then
             effectivePolicy = "TARGET"
+            draining = false
             status = "目标优先"
+
         elseif policy == "IGNORE" then
             draining = false
             status = "忽略"
-        elseif policy == "VOID" then
-            draining = false
-            if USER.voidEnabled then
-                status = "VOID待硬件"
-            else
-                status = "VOID总闸关闭"
-            end
+
         elseif not USER.autoSurplusEnabled then
-            -- Pause, do not forget hysteresis state. Re-enabling continues to low threshold.
-            status = wasDraining and "AUTO暂停·待续" or "AUTO暂停"
+            status =
+                wasDraining
+                and "AUTO暂停·待续"
+                or "AUTO暂停"
+
         else
             if row.amount <= low then
                 draining = false
+
             elseif wasDraining then
                 draining = true
+
             elseif row.amount >= high then
                 draining = true
+
             else
                 draining = false
             end
 
-            if draining then
-                -- Draining means the hysteresis state is active; it is only truly
-                -- processing after chooseSurplusActive() grants a remaining slot.
-                status = "待余矿槽"
-            else
-                status = "等待阈值"
-            end
+            status =
+                draining
+                and "待余矿槽"
+                or "等待阈值"
         end
 
-        -- Explicit IGNORE/VOID cancels persisted AUTO drain. TARGET / global pause do not.
-        if policy == "IGNORE" or policy == "VOID" then
-            if memory.draining then
-                memory.draining = false
+        if isTarget or policy == "IGNORE" then
+            if autoMemory.draining then
+                autoMemory.draining = false
                 stateChanged = true
             end
-        elseif not isTarget and USER.autoSurplusEnabled and draining ~= wasDraining then
-            memory.draining = draining
+
+        elseif USER.autoSurplusEnabled
+           and draining ~= wasDraining
+        then
+            autoMemory.draining = draining
+            stateChanged = true
+        end
+
+        -- ---------- OVERFLOW guard state ----------
+        local overflowMemory =
+            RUNSTATE.overflow[key]
+
+        if type(overflowMemory) ~= "table" then
+            overflowMemory = {active = false}
+            RUNSTATE.overflow[key] = overflowMemory
+        end
+
+        local wasOverflowActive =
+            overflowMemory.active == true
+
+        local overflowActive =
+            wasOverflowActive
+
+        local overflowStatus = "溢流关闭"
+
+        if isTarget then
+            -- TARGET is an absolute no-trash override.
+            overflowActive = false
+            overflowStatus = "TARGET保护"
+
+        elseif not overflowConfigured then
+            overflowActive = false
+            overflowStatus = "溢流未配置"
+
+        elseif not USER.overflowEnabled then
+            overflowStatus =
+                wasOverflowActive
+                and "溢流暂停·待续"
+                or "溢流暂停"
+
+        else
+            if row.amount <= overflowLow then
+                overflowActive = false
+
+            elseif wasOverflowActive then
+                overflowActive = true
+
+            elseif row.amount >= overflowHigh then
+                overflowActive = true
+
+            else
+                overflowActive = false
+            end
+
+            overflowStatus =
+                overflowActive
+                and "待溢流槽"
+                or "溢流待阈值"
+        end
+
+        if isTarget or not overflowConfigured then
+            if overflowMemory.active then
+                overflowMemory.active = false
+                stateChanged = true
+            end
+
+        elseif USER.overflowEnabled
+           and overflowActive ~= wasOverflowActive
+        then
+            overflowMemory.active = overflowActive
             stateChanged = true
         end
 
@@ -1185,26 +1486,53 @@ local function evaluateSurplus(rawRows, targetStates)
             key = key,
             raw = row,
             amount = row.amount,
+
             policy = policy,
             effectivePolicy = effectivePolicy,
             high = high,
             low = low,
             target = isTarget,
-            draining = (isTarget and wasDraining) or draining,
+            draining = draining,
             selected = false,
             status = status,
-            overflowRatio = high > 0 and row.amount / high or 0,
+            overflowRatio =
+                high > 0
+                and row.amount / high
+                or 0,
+
+            overflowConfigured =
+                overflowConfigured,
+            overflowHigh = overflowHigh,
+            overflowLow = overflowLow,
+            overflowActive = overflowActive,
+            overflowSelected = false,
+            overflowStatus = overflowStatus,
+            overflowGuardRatio =
+                overflowHigh > 0
+                and row.amount / overflowHigh
+                or 0,
+
+            legacyVoid = entry.legacyVoid == true,
         })
     end
 
-    if stateChanged then saveRunState() end
+    if stateChanged then
+        saveRunState()
+    end
+
     return states
 end
 
-local function chooseSurplusActive(surplusStates, seenRawItem, remainingSlots)
+local function chooseSurplusActive(
+    surplusStates,
+    seenRawItem,
+    remainingSlots
+)
     local candidates = {}
 
-    if USER.autoSurplusEnabled and remainingSlots > 0 then
+    if USER.autoSurplusEnabled
+       and remainingSlots > 0
+    then
         for _, state in ipairs(surplusStates) do
             if not state.target
                and state.policy == "AUTO"
@@ -1218,21 +1546,34 @@ local function chooseSurplusActive(surplusStates, seenRawItem, remainingSlots)
         end
     end
 
-    table.sort(candidates, function(a, b)
-        if a.overflowRatio == b.overflowRatio then
-            return tostring(displayMaterialLabel(a.raw)) < tostring(displayMaterialLabel(b.raw))
+    table.sort(
+        candidates,
+        function(a, b)
+            if a.overflowRatio == b.overflowRatio then
+                return tostring(
+                    displayMaterialLabel(a.raw)
+                ) < tostring(
+                    displayMaterialLabel(b.raw)
+                )
+            end
+
+            return a.overflowRatio > b.overflowRatio
         end
-        return a.overflowRatio > b.overflowRatio
-    end)
+    )
 
     local limit = math.min(
-        math.max(0, tonumber(USER.maxSurplusActive) or 0),
+        math.max(
+            0,
+            tonumber(USER.maxSurplusActive) or 0
+        ),
         math.max(0, remainingSlots)
     )
 
     local selected = {}
+
     for _, state in ipairs(candidates) do
         if #selected >= limit then break end
+
         local id = itemId(state.raw.best)
 
         if id and not seenRawItem[id] then
@@ -1240,6 +1581,7 @@ local function chooseSurplusActive(surplusStates, seenRawItem, remainingSlots)
             state.selected = true
             state.status = "余矿处理中"
             table.insert(selected, state)
+
         elseif id and seenRawItem[id] then
             state.status = "目标占用"
         end
@@ -1248,10 +1590,90 @@ local function chooseSurplusActive(surplusStates, seenRawItem, remainingSlots)
     return selected
 end
 
-local function combineDispatch(targetSelected, surplusSelected)
+local function chooseOverflowActive(
+    surplusStates,
+    overflowBusAvailable,
+    slotLimit
+)
+    local candidates = {}
+
+    if USER.overflowEnabled
+       and overflowBusAvailable
+       and slotLimit > 0
+    then
+        for _, state in ipairs(surplusStates) do
+            if not state.target
+               and state.overflowConfigured
+               and state.overflowActive
+               and state.raw
+               and state.raw.best
+               and (state.amount or 0)
+                   > state.overflowLow
+            then
+                table.insert(candidates, state)
+            end
+        end
+    end
+
+    table.sort(
+        candidates,
+        function(a, b)
+            if a.overflowGuardRatio
+               == b.overflowGuardRatio
+            then
+                return tostring(
+                    displayMaterialLabel(a.raw)
+                ) < tostring(
+                    displayMaterialLabel(b.raw)
+                )
+            end
+
+            return a.overflowGuardRatio
+                > b.overflowGuardRatio
+        end
+    )
+
+    local limit = math.min(
+        math.max(
+            0,
+            tonumber(USER.maxOverflowActive) or 0
+        ),
+        math.max(0, slotLimit)
+    )
+
     local selected = {}
-    for _, state in ipairs(targetSelected) do table.insert(selected, state) end
-    for _, state in ipairs(surplusSelected) do table.insert(selected, state) end
+    local seen = {}
+
+    for _, state in ipairs(candidates) do
+        if #selected >= limit then break end
+
+        local id = itemId(state.raw.best)
+
+        if id and not seen[id] then
+            seen[id] = true
+            state.overflowSelected = true
+            state.overflowStatus = "溢流拦截中"
+            table.insert(selected, state)
+        end
+    end
+
+    return selected
+end
+
+local function combineDispatch(
+    targetSelected,
+    surplusSelected
+)
+    local selected = {}
+
+    for _, state in ipairs(targetSelected) do
+        table.insert(selected, state)
+    end
+
+    for _, state in ipairs(surplusSelected) do
+        table.insert(selected, state)
+    end
+
     return selected
 end
 
@@ -1300,62 +1722,101 @@ local function applyStorageWhitelist(bus, side, managedSlots, selected)
 end
 
 -- ============================================================
--- 交互维护锁
+-- Bus control / maintenance lock
 -- ============================================================
 --
--- v0.6.0 的 io.read() 会阻塞整个控制循环。
--- v0.6.1-stable 在进入任何阻塞式编辑前，先清空受控过滤槽，
--- 但保留独立安全哨兵，因此矿处会“暂停进料”而不是继续过量加工。
--- 编辑结束后主循环立即重扫并恢复应有白名单。
+-- The GUI last slot of EVERY OC-managed Storage Bus is a reserved
+-- manual placeholder slot. This program never touches it.
+--
+-- Blocking io.read() is still used for text entry in this release.
+-- Before entering a blocking prompt, dynamic slots on BOTH buses are
+-- cleared, so processing/overflow pauses safely while the user types.
 --
 local CONTROL = {
-    bus = nil,
-    side = nil,
-    managedSlots = nil,
-    sentinelSlot = nil,
-    sentinelRequired = false,
+    processBus = nil,
+    processSide = nil,
+    processManagedSlots = 0,
+
+    overflowBus = nil,
+    overflowSide = nil,
+    overflowManagedSlots = 0,
 }
 
-local function ensureSentinelSafe()
-    if not CONTROL.sentinelRequired then return true end
+local function clearControlledBus(
+    bus,
+    side,
+    managedSlots
+)
+    if not bus
+       or not side
+       or not managedSlots
+       or managedSlots <= 0
+    then
+        return true
+    end
 
-    local ok, detail = readSentinel(
-        CONTROL.bus,
-        CONTROL.side,
-        CONTROL.sentinelSlot
+    if CFG.dryRun then
+        return true
+    end
+
+    local ok, result = pcall(
+        applyStorageWhitelist,
+        bus,
+        side,
+        managedSlots,
+        {}
     )
 
     if not ok then
-        return nil, detail
+        return nil, tostring(result)
     end
 
     return true
 end
 
 local function enterMaintenanceMode()
-    if not CONTROL.bus then return true end
-
-    local safe, safeErr = ensureSentinelSafe()
-    if not safe then
-        return nil, safeErr
-    end
-
-    -- DRY RUN 本来就不会写总线，无需额外动作。
-    if CFG.dryRun then return true end
-
-    local ok, result = pcall(
-        applyStorageWhitelist,
-        CONTROL.bus,
-        CONTROL.side,
-        CONTROL.managedSlots,
-        {}
+    local ok, err = clearControlledBus(
+        CONTROL.processBus,
+        CONTROL.processSide,
+        CONTROL.processManagedSlots
     )
 
     if not ok then
-        return nil, "进入维护模式失败: " .. tostring(result)
+        return nil,
+            "暂停 PROCESS 总线失败: "
+            .. tostring(err)
+    end
+
+    ok, err = clearControlledBus(
+        CONTROL.overflowBus,
+        CONTROL.overflowSide,
+        CONTROL.overflowManagedSlots
+    )
+
+    if not ok then
+        return nil,
+            "暂停 OVERFLOW 总线失败: "
+            .. tostring(err)
     end
 
     return true
+end
+
+local function safeStopBuses()
+    -- Best-effort cleanup. Never touches the reserved last slot.
+    pcall(
+        clearControlledBus,
+        CONTROL.processBus,
+        CONTROL.processSide,
+        CONTROL.processManagedSlots
+    )
+
+    pcall(
+        clearControlledBus,
+        CONTROL.overflowBus,
+        CONTROL.overflowSide,
+        CONTROL.overflowManagedSlots
+    )
 end
 
 -- ============================================================
@@ -1428,11 +1889,12 @@ end
 local function cachePolicyRank(state)
     if state.effectivePolicy == "TARGET" then return 1 end
     if state.selected then return 2 end
-    if state.policy == "AUTO" and state.draining then return 3 end
-    if state.policy == "AUTO" and state.amount >= state.high then return 4 end
-    if state.policy == "VOID" then return 5 end
-    if state.policy == "IGNORE" then return 6 end
-    return 7
+    if state.overflowSelected then return 3 end
+    if state.policy == "AUTO" and state.draining then return 4 end
+    if state.overflowConfigured and state.overflowActive then return 5 end
+    if state.policy == "AUTO" and state.amount >= state.high then return 6 end
+    if state.policy == "IGNORE" then return 7 end
+    return 8
 end
 
 local function sortCacheForUI(states)
@@ -1534,7 +1996,6 @@ local function policyColor(policy)
     if policy == "TARGET" then return COLORS.purple end
     if policy == "AUTO" then return COLORS.cyan end
     if policy == "IGNORE" then return COLORS.muted end
-    if policy == "VOID" then return COLORS.amber end
     return COLORS.text
 end
 
@@ -1641,12 +2102,12 @@ local function renderTextFallback(targetStates, surplusStates, info)
 
     print("矿石处理控制中心 / ORE PROCESSING CONTROL CENTER v" .. VERSION)
     print(string.format(
-        "%s | TARGET %d/%d | AUTO %d | raw=%d | surplus=%s",
+        "%s | TARGET %d/%d | AUTO %d | OVERFLOW %d | raw=%d",
         CFG.dryRun and "[DRY RUN]" or "[LIVE]",
         info.targetActiveCount, info.targetCount,
         info.surplusActiveCount,
-        info.rawMaterialCount or 0,
-        USER.autoSurplusEnabled and "ON" or "OFF"
+        info.overflowActiveCount or 0,
+        info.rawMaterialCount or 0
     ))
     print(string.rep("-", 96))
 
@@ -1654,11 +2115,13 @@ local function renderTextFallback(targetStates, surplusStates, info)
         sortCacheForUI(surplusStates)
         for _, s in ipairs(surplusStates) do
             print(string.format(
-                "%s %10s  %-8s  %s / %s  %s",
+                "%s %10s  %-8s AUTO %s/%s  OVF %s  %s",
                 fitText(displayMaterialLabel(s.raw), 24),
                 fmtAmount(s.amount),
                 s.effectivePolicy,
-                fmtAmount(s.high), fmtAmount(s.low), s.status
+                fmtAmount(s.high), fmtAmount(s.low),
+                s.overflowConfigured and "ON" or "OFF",
+                s.overflowSelected and "溢流拦截" or s.status
             ))
         end
     else
@@ -1689,7 +2152,7 @@ local function renderTargetPage(states, info)
     drawCard(x, cy, cardW, "目标", info.targetCount, COLORS.green); x = x + cardW + gap
     drawCard(x, cy, cardW, "TARGET运行", info.targetActiveCount, COLORS.cyan); x = x + cardW + gap
     drawCard(x, cy, cardW, "AUTO运行", info.surplusActiveCount, COLORS.blue); x = x + cardW + gap
-    drawCard(x, cy, cardW, "缓存矿种", info.rawMaterialCount or 0, COLORS.amber); x = x + cardW + gap
+    drawCard(x, cy, cardW, "溢流拦截", info.overflowActiveCount or 0, COLORS.amber); x = x + cardW + gap
     drawCard(x, cy, math.max(12, w - x - 2), "待同步", info.changes, info.changes > 0 and COLORS.amber or COLORS.green)
 
     local stripY = 10
@@ -1698,9 +2161,12 @@ local function renderTargetPage(states, info)
     gpuText(math.floor(w * 0.36), stripY, "缓存网 " .. shortAddress(info.cacheAddress), COLORS.muted, COLORS.panel2)
     gpuText(math.floor(w * 0.68), stripY, "存储总线 " .. shortAddress(info.busAddress) .. "  S" .. tostring(info.side), COLORS.muted, COLORS.panel2)
     gpuText(5, stripY + 1, string.format(
-        "scan %d stacks · %d ores · %d materials · AUTO %s",
-        info.networkStackCount or 0, info.oreStackCount or 0, info.rawMaterialCount or 0,
-        USER.autoSurplusEnabled and "ON" or "OFF"
+        "scan %d stacks · %d ores · %d materials · AUTO %s · OVERFLOW %s",
+        info.networkStackCount or 0,
+        info.oreStackCount or 0,
+        info.rawMaterialCount or 0,
+        USER.autoSurplusEnabled and "ON" or "OFF",
+        USER.overflowEnabled and "ON" or "OFF"
     ), COLORS.muted, COLORS.panel2)
 
     local headerY = 13
@@ -1792,101 +2258,428 @@ end
 
 local function renderCachePage(states, info)
     local w, h = UI.w, UI.h
-    gpuFill(1, 1, w, h, COLORS.bg)
-    drawHeader("矿物缓存管理", "CACHE POLICY  ·  TARGET > AUTO > IGNORE / VOID(reserved)  ·  v" .. VERSION)
 
-    local toggleSpec = {
+    gpuFill(1, 1, w, h, COLORS.bg)
+
+    drawHeader(
+        "矿物缓存管理",
+        "CACHE POLICY  ·  TARGET > AUTO / IGNORE  +  OVERFLOW GUARD  ·  v"
+        .. VERSION
+    )
+
+    local autoSpec = {
         id = "toggle_auto",
-        label = USER.autoSurplusEnabled and "余矿自动 ON" or "余矿自动 OFF",
+        label =
+            USER.autoSurplusEnabled
+            and "AUTO ON"
+            or "AUTO OFF",
         enabled = true,
     }
-    drawButton(toggleSpec, 3, 6, 14)
+
+    local overflowSpec = {
+        id = "toggle_overflow",
+        label =
+            USER.overflowEnabled
+            and "溢流 ON"
+            or "溢流 OFF",
+        enabled = true,
+    }
+
+    drawButton(autoSpec, 3, 6, 14)
+    drawButton(overflowSpec, 18, 6, 14)
 
     local totalAmount = info.totalRawAmount or 0
     local gap = 2
-    local cardW = math.max(13, math.floor((w - 22 - gap * 3) / 4))
-    local x = 20
-    drawCard(x, 6, cardW, "缓存矿种", info.rawMaterialCount or 0, COLORS.amber); x = x + cardW + gap
-    drawCard(x, 6, cardW, "总缓存", fmtAmount(totalAmount), COLORS.green); x = x + cardW + gap
-    drawCard(x, 6, cardW, "AUTO运行", info.surplusActiveCount, COLORS.cyan); x = x + cardW + gap
-    drawCard(x, 6, math.max(13, w - x - 2), "余矿并发", tostring(info.surplusActiveCount) .. "/" .. tostring(USER.maxSurplusActive), COLORS.blue)
+    local cardW = math.max(
+        13,
+        math.floor((w - 37 - gap * 3) / 4)
+    )
+
+    local x = 35
+
+    drawCard(
+        x, 6, cardW,
+        "缓存矿种",
+        info.rawMaterialCount or 0,
+        COLORS.amber
+    )
+    x = x + cardW + gap
+
+    drawCard(
+        x, 6, cardW,
+        "总缓存",
+        fmtAmount(totalAmount),
+        COLORS.green
+    )
+    x = x + cardW + gap
+
+    drawCard(
+        x, 6, cardW,
+        "AUTO运行",
+        info.surplusActiveCount,
+        COLORS.cyan
+    )
+    x = x + cardW + gap
+
+    drawCard(
+        x, 6,
+        math.max(13, w - x - 2),
+        "溢流拦截",
+        info.overflowActiveCount or 0,
+        COLORS.amber
+    )
 
     local stripY = 10
     gpuFill(3, stripY, w - 4, 2, COLORS.panel2)
-    gpuText(5, stripY, "默认 AUTO 阈值 " .. fmtAmount(USER.surplusHigh) .. " → " .. fmtAmount(USER.surplusLow), COLORS.muted, COLORS.panel2)
-    gpuText(math.floor(w * 0.43), stripY, "未标记矿默认 " .. tostring(USER.defaultPolicy), COLORS.muted, COLORS.panel2)
-    gpuText(math.floor(w * 0.70), stripY, "VOID: 仅显式逐矿允许；当前待独立销毁通道实机验证", COLORS.amber, COLORS.panel2)
-    gpuText(5, stripY + 1, "点击矿物行选中；[策略]可设置 AUTO / IGNORE / VOID(预留) 及单矿阈值", COLORS.muted, COLORS.panel2)
+
+    gpuText(
+        5,
+        stripY,
+        "AUTO "
+        .. fmtAmount(USER.surplusHigh)
+        .. " → "
+        .. fmtAmount(USER.surplusLow),
+        COLORS.muted,
+        COLORS.panel2
+    )
+
+    gpuText(
+        math.floor(w * 0.35),
+        stripY,
+        "默认溢流 "
+        .. fmtAmount(USER.overflowHigh)
+        .. " / 恢复 "
+        .. fmtAmount(USER.overflowLow),
+        COLORS.muted,
+        COLORS.panel2
+    )
+
+    local overflowBusText
+
+    if info.overflowConnected then
+        overflowBusText =
+            "OVERFLOW BUS "
+            .. shortAddress(info.overflowBusAddress)
+    else
+        overflowBusText =
+            "OVERFLOW BUS 未连接"
+    end
+
+    gpuText(
+        math.floor(w * 0.70),
+        stripY,
+        overflowBusText,
+        info.overflowConnected
+            and COLORS.green
+            or COLORS.amber,
+        COLORS.panel2
+    )
+
+    gpuText(
+        5,
+        stripY + 1,
+        "加工策略与溢流保护相互独立：AUTO 可与 OVERFLOW 同时启用；TARGET 永远禁止溢流",
+        COLORS.muted,
+        COLORS.panel2
+    )
 
     local headerY = 13
     local nameX = 4
-    local amountX = math.floor(w * 0.48)
-    local policyX = math.floor(w * 0.63)
-    local thresholdX = math.floor(w * 0.73)
-    local statusX = w - 17
+    local amountX = math.floor(w * 0.46)
+    local policyX = math.floor(w * 0.58)
+    local thresholdX = math.floor(w * 0.68)
+    local statusX = w - 18
 
-    gpuText(nameX, headerY, "矿物（点击选择）", COLORS.muted, COLORS.bg)
-    gpuText(amountX, headerY, "缓存量", COLORS.muted, COLORS.bg)
-    gpuText(policyX, headerY, "策略", COLORS.muted, COLORS.bg)
-    gpuText(thresholdX, headerY, "启动 / 保留", COLORS.muted, COLORS.bg)
-    gpuText(statusX, headerY, "状态", COLORS.muted, COLORS.bg)
-    gpuFill(3, headerY + 1, w - 4, 1, COLORS.border)
+    gpuText(
+        nameX,
+        headerY,
+        "矿物（点击选择）",
+        COLORS.muted,
+        COLORS.bg
+    )
+
+    gpuText(
+        amountX,
+        headerY,
+        "缓存量",
+        COLORS.muted,
+        COLORS.bg
+    )
+
+    gpuText(
+        policyX,
+        headerY,
+        "加工",
+        COLORS.muted,
+        COLORS.bg
+    )
+
+    gpuText(
+        thresholdX,
+        headerY,
+        "AUTO 启动/停止",
+        COLORS.muted,
+        COLORS.bg
+    )
+
+    gpuText(
+        statusX,
+        headerY,
+        "状态",
+        COLORS.muted,
+        COLORS.bg
+    )
+
+    gpuFill(
+        3,
+        headerY + 1,
+        w - 4,
+        1,
+        COLORS.border
+    )
 
     sortCacheForUI(states)
     LAST_CONTEXT.surplusByKey = {}
 
     local rowY = headerY + 2
     local rowH = 3
-    local maxRows = math.max(1, math.floor((h - rowY - 2 + 1) / rowH))
+    local maxRows = math.max(
+        1,
+        math.floor(
+            (h - rowY - 2 + 1) / rowH
+        )
+    )
+
     UI.cachePageSize = maxRows
 
-    local maxOffset = math.max(0, #states - maxRows)
-    UI.cacheOffset = math.max(0, math.min(UI.cacheOffset or 0, maxOffset))
+    local maxOffset =
+        math.max(0, #states - maxRows)
 
-    local nameW = math.max(16, amountX - nameX - 2)
+    UI.cacheOffset =
+        math.max(
+            0,
+            math.min(
+                UI.cacheOffset or 0,
+                maxOffset
+            )
+        )
+
+    local nameW =
+        math.max(
+            16,
+            amountX - nameX - 2
+        )
+
     local selectedStillExists = false
 
     for _, s in ipairs(states) do
         LAST_CONTEXT.surplusByKey[s.key] = s
-        if s.key == UI.selectedMaterialKey then selectedStillExists = true end
+
+        if s.key == UI.selectedMaterialKey then
+            selectedStillExists = true
+        end
     end
 
     local firstIndex = UI.cacheOffset + 1
-    local lastIndex = math.min(#states, UI.cacheOffset + maxRows)
+    local lastIndex =
+        math.min(
+            #states,
+            UI.cacheOffset + maxRows
+        )
 
     for i = firstIndex, lastIndex do
         local s = states[i]
+        local y =
+            rowY + (i - firstIndex) * rowH
 
-        local y = rowY + (i - firstIndex) * rowH
-        local selected = s.key == UI.selectedMaterialKey
-        local rowBg = selected and COLORS.selected or ((i % 2 == 1) and COLORS.panel or COLORS.panel2)
-        local pColor = policyColor(s.effectivePolicy)
-        local sColor = statusColor(s.status)
+        local selected =
+            s.key == UI.selectedMaterialKey
 
-        gpuFill(3, y, w - 4, 2, rowBg)
-        gpuFill(3, y, 1, 2, selected and COLORS.blue or pColor)
-        registerRegion({id = "select_material", data = s.key}, 3, y, w - 4, 2)
+        local rowBg =
+            selected
+            and COLORS.selected
+            or (
+                (i % 2 == 1)
+                and COLORS.panel
+                or COLORS.panel2
+            )
 
-        gpuText(nameX + 1, y, fitText(displayMaterialLabel(s.raw), nameW), COLORS.text, rowBg)
-        gpuText(amountX, y, fmtAmount(s.amount), s.amount >= s.high and COLORS.amber or COLORS.text, rowBg)
-        gpuText(policyX, y, s.effectivePolicy, pColor, rowBg)
-        gpuText(thresholdX, y, fmtAmount(s.high) .. " / " .. fmtAmount(s.low), COLORS.text, rowBg)
-        gpuText(statusX, y, fitText(s.status, 16), sColor, rowBg)
+        local pColor =
+            policyColor(s.effectivePolicy)
 
-        local thresholdRatio = 0
-        if s.high > s.low then thresholdRatio = (s.amount - s.low) / (s.high - s.low) end
-        drawSolidBar(nameX + 1, y + 1, math.max(10, nameW - 10), thresholdRatio)
+        local mainStatus = s.status
+        local mainColor = statusColor(s.status)
 
-        local detail = "内部 " .. tostring(s.key)
-            .. " · variants " .. tostring(s.raw.variantCount or 1)
-            .. (s.target and " · TARGET覆盖底层策略" or "")
-        gpuText(amountX, y + 1, fitText(detail, math.max(10, statusX - amountX - 2)), COLORS.muted, rowBg)
+        if s.overflowSelected then
+            mainStatus = "溢流拦截中"
+            mainColor = COLORS.amber
+        elseif s.target
+           and s.overflowConfigured
+        then
+            mainStatus = "TARGET保护"
+            mainColor = COLORS.purple
+        end
+
+        gpuFill(
+            3,
+            y,
+            w - 4,
+            2,
+            rowBg
+        )
+
+        gpuFill(
+            3,
+            y,
+            1,
+            2,
+            selected
+                and COLORS.blue
+                or (
+                    s.overflowSelected
+                    and COLORS.amber
+                    or pColor
+                )
+        )
+
+        registerRegion(
+            {
+                id = "select_material",
+                data = s.key
+            },
+            3,
+            y,
+            w - 4,
+            2
+        )
+
+        gpuText(
+            nameX + 1,
+            y,
+            fitText(
+                displayMaterialLabel(s.raw),
+                nameW
+            ),
+            COLORS.text,
+            rowBg
+        )
+
+        gpuText(
+            amountX,
+            y,
+            fmtAmount(s.amount),
+            (
+                s.overflowConfigured
+                and s.amount >= s.overflowHigh
+            )
+                and COLORS.amber
+                or COLORS.text,
+            rowBg
+        )
+
+        gpuText(
+            policyX,
+            y,
+            s.effectivePolicy,
+            pColor,
+            rowBg
+        )
+
+        gpuText(
+            thresholdX,
+            y,
+            fmtAmount(s.high)
+            .. " / "
+            .. fmtAmount(s.low),
+            COLORS.text,
+            rowBg
+        )
+
+        gpuText(
+            statusX,
+            y,
+            fitText(mainStatus, 17),
+            mainColor,
+            rowBg
+        )
+
+        local barRatio = 0
+
+        if s.policy == "AUTO"
+           and s.high > s.low
+        then
+            barRatio =
+                (s.amount - s.low)
+                / (s.high - s.low)
+
+        elseif s.overflowConfigured
+           and s.overflowHigh > s.overflowLow
+        then
+            barRatio =
+                (s.amount - s.overflowLow)
+                / (
+                    s.overflowHigh
+                    - s.overflowLow
+                )
+        end
+
+        drawSolidBar(
+            nameX + 1,
+            y + 1,
+            math.max(10, nameW - 10),
+            barRatio
+        )
+
+        local overflowDetail
+
+        if s.overflowConfigured then
+            overflowDetail =
+                "溢流 "
+                .. fmtAmount(s.overflowHigh)
+                .. " / "
+                .. fmtAmount(s.overflowLow)
+                .. " · "
+                .. s.overflowStatus
+        else
+            overflowDetail = "溢流 OFF"
+        end
+
+        local detail =
+            overflowDetail
+            .. " · variants "
+            .. tostring(
+                s.raw.variantCount or 1
+            )
+            .. (
+                s.legacyVoid
+                and " · 旧VOID已安全迁移为IGNORE"
+                or ""
+            )
+
+        gpuText(
+            amountX,
+            y + 1,
+            fitText(
+                detail,
+                math.max(
+                    10,
+                    statusX - amountX - 2
+                )
+            ),
+            COLORS.muted,
+            rowBg
+        )
     end
 
-    if UI.selectedMaterialKey and not selectedStillExists then UI.selectedMaterialKey = nil end
+    if UI.selectedMaterialKey
+       and not selectedStillExists
+    then
+        UI.selectedMaterialKey = nil
+    end
 
     local footerY = h
     local leftFooter
+
     if #states > maxRows then
         leftFooter = string.format(
             "矿物 %d-%d / %d · 鼠标滚轮上下浏览",
@@ -1895,13 +2688,50 @@ local function renderCachePage(states, info)
             #states
         )
     else
-        leftFooter = "AUTO: 达到高阈值启动，开始后持续到低阈值；重启后保持状态"
+        leftFooter =
+            "OVERFLOW 只拦截后续新增，不主动清理已有库存"
     end
-    gpuText(3, footerY, leftFooter, #states > maxRows and COLORS.amber or COLORS.muted, COLORS.bg)
 
-    local rightFooter = USER.autoSurplusEnabled and "余矿自动加工 ACTIVE" or "余矿自动加工 PAUSED"
-    local rfW = displayWidth(rightFooter)
-    gpuText(math.max(3, w - rfW - 2), footerY, rightFooter, USER.autoSurplusEnabled and COLORS.green or COLORS.amber, COLORS.bg)
+    gpuText(
+        3,
+        footerY,
+        leftFooter,
+        #states > maxRows
+            and COLORS.amber
+            or COLORS.muted,
+        COLORS.bg
+    )
+
+    local rightFooter
+
+    if not info.overflowConnected then
+        rightFooter = "溢流总线未连接"
+    elseif USER.overflowEnabled then
+        rightFooter =
+            "溢流保护 ACTIVE · "
+            .. tostring(info.overflowActiveCount or 0)
+            .. "/"
+            .. tostring(USER.maxOverflowActive)
+    else
+        rightFooter = "溢流保护 PAUSED"
+    end
+
+    local rfW =
+        displayWidth(rightFooter)
+
+    gpuText(
+        math.max(3, w - rfW - 2),
+        footerY,
+        rightFooter,
+        (
+            info.overflowConnected
+            and USER.overflowEnabled
+        )
+            and COLORS.green
+            or COLORS.amber,
+        COLORS.bg
+    )
+
     gpuColors(COLORS.text, COLORS.bg)
 end
 
@@ -1985,10 +2815,14 @@ end
 
 local function editMaterialPolicy()
     local key = UI.selectedMaterialKey
-    local state = key and LAST_CONTEXT.surplusByKey[key]
+    local state =
+        key and LAST_CONTEXT.surplusByKey[key]
+
     if not state then return end
 
-    local safe, safeErr = enterMaintenanceMode()
+    local safe, safeErr =
+        enterMaintenanceMode()
+
     if not safe then
         cleanupUI()
         print("无法进入安全维护模式：")
@@ -1998,49 +2832,115 @@ local function editMaterialPolicy()
         return
     end
 
-    local entry, policy, high, low = materialSetting(key)
+    local entry,
+          policy,
+          high,
+          low,
+          overflowConfigured,
+          overflowHigh,
+          overflowLow =
+        materialSetting(key)
 
     cleanupUI()
     resetUIAfterPrompt()
 
-    print("GTNH Ore Dispatch Controller v" .. VERSION)
+    print(
+        "GTNH Ore Dispatch Controller v"
+        .. VERSION
+    )
     print(string.rep("=", 72))
-    print("矿物策略: " .. displayMaterialLabel(state.raw) .. "  [" .. key .. "]")
-    if state.target then print("注意：当前属于 TARGET；TARGET 会暂时覆盖这里设置的底层策略。") end
-    print("A = AUTO 自动余矿加工")
-    print("I = IGNORE 永久忽略")
-    print("V = VOID 过量销毁（本版只记录策略；不会真的销毁）")
-    print("当前策略: " .. policy)
-    io.write("新策略 [A/I/V，回车保持]: ")
 
-    local p = trim(io.read() or "")
+    print(
+        "矿物策略: "
+        .. displayMaterialLabel(state.raw)
+        .. "  ["
+        .. key
+        .. "]"
+    )
+
+    if state.target then
+        print(
+            "注意：当前属于 TARGET；"
+            .. "TARGET 会覆盖后台加工并强制关闭溢流。"
+        )
+    end
+
+    print("")
+    print("一、后台加工")
+    print("A = AUTO  超量时送矿处加工")
+    print("I = IGNORE 不进行后台加工")
+    print("当前: " .. policy)
+
+    io.write(
+        "加工策略 [A/I，回车保持]: "
+    )
+
+    local p =
+        trim(io.read() or "")
+
     if p ~= "" then
         p = p:upper()
-        if p == "A" or p == "AUTO" then policy = "AUTO"
-        elseif p == "I" or p == "IGNORE" then policy = "IGNORE"
-        elseif p == "V" or p == "VOID" then policy = "VOID"
+
+        if p == "A" or p == "AUTO" then
+            policy = "AUTO"
+
+        elseif p == "I"
+           or p == "IGNORE"
+        then
+            policy = "IGNORE"
+
         else
-            print("无效策略，未保存。按回车返回。")
+            print(
+                "无效加工策略，未保存。"
+                .. "按回车返回。"
+            )
             io.read()
             return
         end
     end
 
-    if policy == "AUTO" or policy == "VOID" then
-        io.write("启动阈值 [当前 " .. fmtAmount(high) .. ", 支持 100M/1G]: ")
-        local highText = trim(io.read() or "")
-        local newHigh = parseAmount(highText, high)
+    if policy == "AUTO" then
+        io.write(
+            "AUTO 启动阈值 [当前 "
+            .. fmtAmount(high)
+            .. "]: "
+        )
+
+        local highText =
+            trim(io.read() or "")
+
+        local newHigh =
+            parseAmount(highText, high)
+
         if not newHigh or newHigh <= 0 then
-            print("启动阈值无效，未保存。按回车返回。")
+            print(
+                "AUTO 启动阈值无效，未保存。"
+                .. "按回车返回。"
+            )
             io.read()
             return
         end
 
-        io.write("停止/保留阈值 [当前 " .. fmtAmount(low) .. "]: ")
-        local lowText = trim(io.read() or "")
-        local newLow = parseAmount(lowText, low)
-        if not newLow or newLow < 0 or newLow >= newHigh then
-            print("必须满足 0 <= 保留阈值 < 启动阈值，未保存。按回车返回。")
+        io.write(
+            "AUTO 停止阈值 [当前 "
+            .. fmtAmount(low)
+            .. "]: "
+        )
+
+        local lowText =
+            trim(io.read() or "")
+
+        local newLow =
+            parseAmount(lowText, low)
+
+        if not newLow
+           or newLow < 0
+           or newLow >= newHigh
+        then
+            print(
+                "必须满足 0 <= AUTO停止 < AUTO启动。"
+                .. "未保存。按回车返回。"
+            )
             io.read()
             return
         end
@@ -2048,22 +2948,155 @@ local function editMaterialPolicy()
         high, low = newHigh, newLow
     end
 
+    print("")
+    print("二、溢流保护")
+    print(
+        "作用：超过上限后，把后续新进入 AE 的该矿"
+        .. "导向高优先级垃圾 Storage Bus。"
+    )
+    print(
+        "不会主动把已经存下来的库存抽出来销毁。"
+    )
+
+    print(
+        "当前: "
+        .. (
+            overflowConfigured
+            and "ON"
+            or "OFF"
+        )
+    )
+
+    io.write(
+        "溢流保护 [Y/N，回车保持]: "
+    )
+
+    local o =
+        trim(io.read() or "")
+
+    if o ~= "" then
+        o = o:upper()
+
+        if o == "Y"
+           or o == "YES"
+           or o == "ON"
+        then
+            overflowConfigured = true
+
+        elseif o == "N"
+           or o == "NO"
+           or o == "OFF"
+        then
+            overflowConfigured = false
+
+        else
+            print(
+                "无效溢流设置，未保存。"
+                .. "按回车返回。"
+            )
+            io.read()
+            return
+        end
+    end
+
+    if overflowConfigured then
+        io.write(
+            "溢流启动上限 [当前 "
+            .. fmtAmount(overflowHigh)
+            .. "]: "
+        )
+
+        local overflowHighText =
+            trim(io.read() or "")
+
+        local newOverflowHigh =
+            parseAmount(
+                overflowHighText,
+                overflowHigh
+            )
+
+        if not newOverflowHigh
+           or newOverflowHigh <= 0
+        then
+            print(
+                "溢流上限无效，未保存。"
+                .. "按回车返回。"
+            )
+            io.read()
+            return
+        end
+
+        io.write(
+            "溢流恢复线 [当前 "
+            .. fmtAmount(overflowLow)
+            .. "]: "
+        )
+
+        local overflowLowText =
+            trim(io.read() or "")
+
+        local newOverflowLow =
+            parseAmount(
+                overflowLowText,
+                overflowLow
+            )
+
+        if not newOverflowLow
+           or newOverflowLow < 0
+           or newOverflowLow
+               >= newOverflowHigh
+        then
+            print(
+                "必须满足 0 <= 溢流恢复线 < 溢流上限。"
+                .. "未保存。按回车返回。"
+            )
+            io.read()
+            return
+        end
+
+        overflowHigh =
+            newOverflowHigh
+
+        overflowLow =
+            newOverflowLow
+    end
+
     entry.policy = policy
     entry.high = high
     entry.low = low
+    entry.overflow = overflowConfigured
+    entry.overflowHigh = overflowHigh
+    entry.overflowLow = overflowLow
+    entry.legacyVoid = nil
+
     USER.materials[key] = entry
 
-    -- Explicit policy edit cancels old AUTO run memory. New AUTO must satisfy the new high threshold.
-    if RUNSTATE.surplus[key] and RUNSTATE.surplus[key].draining then
+    -- Explicit edits reset both hysteresis memories.
+    if RUNSTATE.surplus[key]
+       and RUNSTATE.surplus[key].draining
+    then
         RUNSTATE.surplus[key].draining = false
-        saveRunState()
     end
 
+    if RUNSTATE.overflow[key]
+       and RUNSTATE.overflow[key].active
+    then
+        RUNSTATE.overflow[key].active = false
+    end
+
+    saveRunState()
     saveUserConfig()
 end
 
 local function toggleAutoSurplus()
-    USER.autoSurplusEnabled = not USER.autoSurplusEnabled
+    USER.autoSurplusEnabled =
+        not USER.autoSurplusEnabled
+    saveUserConfig()
+end
+
+local function toggleOverflow()
+    USER.overflowEnabled =
+        not USER.overflowEnabled
     saveUserConfig()
 end
 
@@ -2096,6 +3129,9 @@ local function handleRegion(region)
         return "refresh"
     elseif region.id == "toggle_auto" then
         toggleAutoSurplus()
+        return "refresh"
+    elseif region.id == "toggle_overflow" then
+        toggleOverflow()
         return "refresh"
     end
 
@@ -2155,98 +3191,279 @@ end
 local function main()
     validateConfig()
 
-    local productMe, cacheMe, meInfo = resolveMeNetworks()
-    local bus, side, slotCount, busAddress = resolveStorageBus()
+    local productMe,
+          cacheMe,
+          meInfo =
+        resolveMeNetworks()
 
-    local managedSlots = tonumber(CFG.managedSlots or slotCount) or slotCount
-    managedSlots = math.min(managedSlots, slotCount)
-    if managedSlots < 1 then error("managedSlots 必须 > 0") end
+    local processBus,
+          processSide,
+          processSlotCount,
+          processBusAddress =
+        resolveProcessStorageBus()
 
-    local sentinelSlot, sentinelRequired =
-        resolveSentinelSlot(slotCount, managedSlots)
+    local overflowBus,
+          overflowSide,
+          overflowSlotCount,
+          overflowBusAddress =
+        resolveOverflowStorageBus()
 
-    CONTROL.bus = bus
-    CONTROL.side = side
-    CONTROL.managedSlots = managedSlots
-    CONTROL.sentinelSlot = sentinelSlot
-    CONTROL.sentinelRequired = sentinelRequired
-
-    if sentinelRequired then
-        local sentinelOk, sentinelDetail =
-            readSentinel(bus, side, sentinelSlot)
-
-        if not sentinelOk and not CFG.dryRun then
-            error(
-                tostring(sentinelDetail)
-                .. "\nLIVE 模式拒绝启动，避免 Storage Bus 零过滤导致全矿放行。"
-            )
-        elseif not sentinelOk then
-            startupWarning = (startupWarning and (startupWarning .. " | ") or "")
-                .. tostring(sentinelDetail)
-        end
+    if overflowBusAddress
+       and overflowBusAddress
+           == processBusAddress
+    then
+        error(
+            "PROCESS 与 OVERFLOW "
+            .. "不能使用同一根 Storage Bus"
+        )
     end
 
-    print("GTNH Ore Dispatch Controller v" .. VERSION)
-    print("配置: " .. tostring(loadedConfigPath))
-    print("用户策略: " .. tostring(loadedUserPath))
-    if startupWarning then print("警告: " .. startupWarning) end
+    local processManagedSlots =
+        managedSlotCount(
+            processSlotCount,
+            CFG.processManagedSlots
+                or CFG.managedSlots,
+            "PROCESS"
+        )
+
+    local overflowManagedSlots = 0
+
+    if overflowBus then
+        overflowManagedSlots =
+            managedSlotCount(
+                overflowSlotCount,
+                CFG.overflowManagedSlots or 16,
+                "OVERFLOW"
+            )
+    end
+
+    CONTROL.processBus = processBus
+    CONTROL.processSide = processSide
+    CONTROL.processManagedSlots =
+        processManagedSlots
+
+    CONTROL.overflowBus = overflowBus
+    CONTROL.overflowSide = overflowSide
+    CONTROL.overflowManagedSlots =
+        overflowManagedSlots
+
+    print(
+        "GTNH Ore Dispatch Controller v"
+        .. VERSION
+    )
+    print(
+        "配置: "
+        .. tostring(loadedConfigPath)
+    )
+    print(
+        "用户策略: "
+        .. tostring(loadedUserPath)
+    )
+
+    print(
+        "PROCESS Bus: "
+        .. tostring(processBusAddress)
+        .. " side="
+        .. tostring(processSide)
+        .. " controlled="
+        .. tostring(processManagedSlots)
+        .. " / "
+        .. tostring(processSlotCount - 1)
+        .. " + 最后一格保留"
+    )
+
+    if overflowBus then
+        print(
+            "OVERFLOW Bus: "
+            .. tostring(overflowBusAddress)
+            .. " side="
+            .. tostring(overflowSide)
+            .. " controlled="
+            .. tostring(overflowManagedSlots)
+            .. " / "
+            .. tostring(overflowSlotCount - 1)
+            .. " + 最后一格保留"
+        )
+    else
+        print(
+            "OVERFLOW Bus: 未配置；"
+            .. "溢流保护只显示策略，不执行"
+        )
+    end
+
+    if startupWarning then
+        print(
+            "警告: "
+            .. startupWarning
+        )
+    end
+
     print("启动完成，进入 Dashboard...")
     os.sleep(1)
 
     RUNNING = true
 
     while RUNNING do
-        local targets, requestInfo = readTargets()
-        local rawCatalog, rawRows, cacheScanInfo = scanRawOreCatalog(cacheMe)
-        local overrides = loadOverrides()
-        local targetStates = evaluateTargets(productMe, rawCatalog, overrides, targets)
+        local targets,
+              requestInfo =
+            readTargets()
 
-        local targetSelected, seenRawItem, activeLimit = chooseTargetActive(targetStates, managedSlots)
-        local surplusStates = evaluateSurplus(rawRows, targetStates)
+        local rawCatalog,
+              rawRows,
+              cacheScanInfo =
+            scanRawOreCatalog(cacheMe)
 
-        local remaining = math.max(0, activeLimit - #targetSelected)
-        local surplusSelected = chooseSurplusActive(surplusStates, seenRawItem, remaining)
-        local selected = combineDispatch(targetSelected, surplusSelected)
+        local overrides =
+            loadOverrides()
 
-        -- 每轮写白名单前重新确认安全哨兵仍存在。
-        -- 玩家若误删占位符，LIVE 会立即停机而不是继续清空过滤槽。
-        if sentinelRequired and not CFG.dryRun then
-            local sentinelOk, sentinelDetail =
-                readSentinel(bus, side, sentinelSlot)
-            if not sentinelOk then
-                error(tostring(sentinelDetail))
-            end
+        local targetStates =
+            evaluateTargets(
+                productMe,
+                rawCatalog,
+                overrides,
+                targets
+            )
+
+        local targetSelected,
+              seenRawItem,
+              activeLimit =
+            chooseTargetActive(
+                targetStates,
+                processManagedSlots
+            )
+
+        local surplusStates =
+            evaluateSurplus(
+                rawRows,
+                targetStates
+            )
+
+        local remaining =
+            math.max(
+                0,
+                activeLimit
+                - #targetSelected
+            )
+
+        local surplusSelected =
+            chooseSurplusActive(
+                surplusStates,
+                seenRawItem,
+                remaining
+            )
+
+        local processSelected =
+            combineDispatch(
+                targetSelected,
+                surplusSelected
+            )
+
+        local overflowSelected =
+            chooseOverflowActive(
+                surplusStates,
+                overflowBus ~= nil,
+                overflowManagedSlots
+            )
+
+        local processChanges =
+            applyStorageWhitelist(
+                processBus,
+                processSide,
+                processManagedSlots,
+                processSelected
+            )
+
+        local overflowChanges = 0
+
+        if overflowBus then
+            -- Even when the global overflow switch is OFF,
+            -- selected is empty, so stale dynamic trash filters are cleared.
+            overflowChanges =
+                applyStorageWhitelist(
+                    overflowBus,
+                    overflowSide,
+                    overflowManagedSlots,
+                    overflowSelected
+                )
         end
 
-        local changes = applyStorageWhitelist(bus, side, managedSlots, selected)
+        local changes =
+            processChanges + overflowChanges
 
-        renderUI(targetStates, surplusStates, {
-            productAddress = meInfo.productAddress,
-            cacheAddress = meInfo.cacheAddress,
-            legacyConfig = meInfo.legacyConfig,
-            busAddress = busAddress,
-            side = side,
-            slotCount = slotCount,
-            managedSlots = managedSlots,
-            requesterCount = requestInfo.requesterCount,
-            targetCount = requestInfo.targetCount,
-            duplicateCount = requestInfo.duplicateCount,
-            networkStackCount = cacheScanInfo.networkStackCount,
-            oreStackCount = cacheScanInfo.oreStackCount,
-            rawAliasCount = cacheScanInfo.rawAliasCount,
-            rawMaterialCount = cacheScanInfo.rawMaterialCount,
-            totalRawAmount = cacheScanInfo.totalRawAmount,
-            targetActiveCount = #targetSelected,
-            surplusActiveCount = #surplusSelected,
-            activeCount = #selected,
-            changes = changes,
-        })
+        renderUI(
+            targetStates,
+            surplusStates,
+            {
+                productAddress =
+                    meInfo.productAddress,
+                cacheAddress =
+                    meInfo.cacheAddress,
+                legacyConfig =
+                    meInfo.legacyConfig,
 
-        local action = waitForNextCycle(tonumber(CFG.controlInterval) or 3)
-        if action == "exit" then break end
-        -- Any touch action returns immediately; loop rescans so UI/dispatch state is never stale.
+                busAddress =
+                    processBusAddress,
+                side =
+                    processSide,
+                slotCount =
+                    processSlotCount,
+                managedSlots =
+                    processManagedSlots,
+
+                overflowConnected =
+                    overflowBus ~= nil,
+                overflowBusAddress =
+                    overflowBusAddress,
+                overflowSide =
+                    overflowSide,
+                overflowSlotCount =
+                    overflowSlotCount,
+                overflowManagedSlots =
+                    overflowManagedSlots,
+
+                requesterCount =
+                    requestInfo.requesterCount,
+                targetCount =
+                    requestInfo.targetCount,
+                duplicateCount =
+                    requestInfo.duplicateCount,
+
+                networkStackCount =
+                    cacheScanInfo.networkStackCount,
+                oreStackCount =
+                    cacheScanInfo.oreStackCount,
+                rawAliasCount =
+                    cacheScanInfo.rawAliasCount,
+                rawMaterialCount =
+                    cacheScanInfo.rawMaterialCount,
+                totalRawAmount =
+                    cacheScanInfo.totalRawAmount,
+
+                targetActiveCount =
+                    #targetSelected,
+                surplusActiveCount =
+                    #surplusSelected,
+                overflowActiveCount =
+                    #overflowSelected,
+                activeCount =
+                    #processSelected,
+                changes =
+                    changes,
+            }
+        )
+
+        local action =
+            waitForNextCycle(
+                tonumber(CFG.controlInterval)
+                or 3
+            )
+
+        if action == "exit" then
+            break
+        end
     end
 
+    safeStopBuses()
     cleanupUI()
     return true
 end
@@ -2257,6 +3474,7 @@ local ok, err = xpcall(main, function(e)
 end)
 
 if not ok then
+    safeStopBuses()
     cleanupUI()
     print("GTNH Ore Dispatch Controller 已停止")
     print(err)
