@@ -1,6 +1,6 @@
 return {
     -- ============================================================
-    -- GTNH Ore Dispatcher v0.5.0
+    -- GTNH Ore Dispatcher v0.6.1-stable
     -- ============================================================
 
     -- 【必须填写】
@@ -17,6 +17,12 @@ return {
     stopRatio = 1.00,
     maxActive = 12,
     managedSlots = 16,
+
+    -- Storage Bus 安全哨兵：默认最后一格。
+    -- 63 格总线 => API slot 62 / GUI 第63格。
+    -- 这一格必须永久放一个不会出现在原矿缓存网中的占位物。
+    requireSentinel = true,
+    sentinelSlot = -1,
 
     -- 安全
     dryRun = true,

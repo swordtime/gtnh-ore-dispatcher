@@ -1,4 +1,4 @@
--- GTNH Ore Dispatcher v0.5.0
+-- GTNH Ore Dispatcher v0.6.1-stable
 -- 仅用于自动 OreDictionary / label 映射失败的极少数例外。
 return {
     -- ["someweirdmaterial"] = {

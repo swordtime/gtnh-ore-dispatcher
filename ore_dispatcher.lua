@@ -1,6 +1,6 @@
 -- GTNH 2.9 / OpenComputers
 -- GTNH Ore Dispatch Controller
--- Release v0.6.0 - Cache Policy
+-- Release v0.6.1-stable - Cache Policy
 --
 -- v0.6.0:
 --   - 全原矿缓存页面（不再只显示请求器目标）
@@ -23,7 +23,7 @@ local computer = require("computer")
 local serialization = require("serialization")
 local filesystem = require("filesystem")
 
-local VERSION = "0.6.0"
+local VERSION = "0.6.1-stable"
 
 local CONFIG_PATH = "/home/ore_dispatch_config.lua"
 local FALLBACK_CONFIG_PATH = "ore_dispatch_config.lua"
@@ -132,6 +132,11 @@ local DEFAULT_USER = {
     surplusHigh = 100000000,
     surplusLow = 10000000,
     maxSurplusActive = 4,
+
+    -- VOID 硬门：本版只持久化，不执行真实销毁。
+    voidEnabled = false,
+    maxVoidActive = 1,
+
     names = {
         items = {},
         materials = {},
@@ -155,9 +160,28 @@ local function normalizeUserConfig(data)
     end
 
     data.defaultPolicy = normalizePolicy(data.defaultPolicy or DEFAULT_USER.defaultPolicy)
+    -- 安全边界：VOID 绝不能成为“所有未知矿物”的默认策略。
+    -- 销毁策略必须逐矿显式设置。
+    if data.defaultPolicy == "VOID" then
+        data.defaultPolicy = "AUTO"
+    end
     data.surplusHigh = tonumber(data.surplusHigh) or DEFAULT_USER.surplusHigh
     data.surplusLow = tonumber(data.surplusLow) or DEFAULT_USER.surplusLow
     data.maxSurplusActive = tonumber(data.maxSurplusActive) or DEFAULT_USER.maxSurplusActive
+
+    if data.voidEnabled == nil then
+        data.voidEnabled = DEFAULT_USER.voidEnabled
+    else
+        data.voidEnabled = data.voidEnabled == true
+    end
+
+    data.maxVoidActive = math.floor(
+        tonumber(data.maxVoidActive) or DEFAULT_USER.maxVoidActive
+    )
+
+    if data.maxVoidActive < 0 then
+        data.maxVoidActive = 0
+    end
 
     if type(data.names) ~= "table" then data.names = {} end
     if type(data.names.items) ~= "table" then data.names.items = {} end
@@ -509,6 +533,63 @@ local function resolveStorageBus()
     end
 
     return bus, side, slotCount, address
+end
+
+-- ============================================================
+-- Storage Bus 安全哨兵
+-- ============================================================
+--
+-- AE Storage Bus 的过滤槽若全部为空，会退化为“不过滤”。
+-- 因此 LIVE 模式必须保留一个不在 managedSlots 范围内的占位过滤项。
+-- 默认使用最后一个 API 槽位（例如 63 格总线的 slot=62）。
+--
+-- 配置：
+--   requireSentinel = true   -- 默认 true
+--   sentinelSlot = -1        -- -1 / nil = 最后一格
+--
+local function resolveSentinelSlot(slotCount, managedSlots)
+    local required = CFG.requireSentinel ~= false
+    if not required then return nil, false end
+
+    local slot = CFG.sentinelSlot
+    if slot == nil or slot == "last" or tonumber(slot) == -1 then
+        slot = slotCount - 1
+    else
+        slot = tonumber(slot)
+    end
+
+    if not slot or slot < 0 or slot >= slotCount then
+        error("sentinelSlot 无效；有效范围 0~" .. tostring(slotCount - 1))
+    end
+
+    if slot < managedSlots then
+        error(
+            "sentinelSlot 必须位于受控槽之外；当前 managedSlots="
+            .. tostring(managedSlots)
+            .. "，sentinelSlot="
+            .. tostring(slot)
+        )
+    end
+
+    return slot, true
+end
+
+local function readSentinel(bus, side, slot)
+    if slot == nil then return true, nil end
+
+    local ok, item = pcall(bus.getStorageConfiguration, side, slot)
+    if not ok then
+        return false, "读取安全哨兵槽失败: " .. tostring(item)
+    end
+
+    if item == nil then
+        return false,
+            "安全哨兵槽为空。请在 Storage Bus GUI 第 "
+            .. tostring(slot + 1)
+            .. " 格放入一个永远不会出现在原矿缓存网中的占位物。"
+    end
+
+    return true, item
 end
 
 local function resolveMeNetworks()
@@ -1060,7 +1141,11 @@ local function evaluateSurplus(rawRows, targetStates)
             status = "忽略"
         elseif policy == "VOID" then
             draining = false
-            status = "销毁未启用"
+            if USER.voidEnabled then
+                status = "VOID待硬件"
+            else
+                status = "VOID总闸关闭"
+            end
         elseif not USER.autoSurplusEnabled then
             -- Pause, do not forget hysteresis state. Re-enabling continues to low threshold.
             status = wasDraining and "AUTO暂停·待续" or "AUTO暂停"
@@ -1215,6 +1300,65 @@ local function applyStorageWhitelist(bus, side, managedSlots, selected)
 end
 
 -- ============================================================
+-- 交互维护锁
+-- ============================================================
+--
+-- v0.6.0 的 io.read() 会阻塞整个控制循环。
+-- v0.6.1-stable 在进入任何阻塞式编辑前，先清空受控过滤槽，
+-- 但保留独立安全哨兵，因此矿处会“暂停进料”而不是继续过量加工。
+-- 编辑结束后主循环立即重扫并恢复应有白名单。
+--
+local CONTROL = {
+    bus = nil,
+    side = nil,
+    managedSlots = nil,
+    sentinelSlot = nil,
+    sentinelRequired = false,
+}
+
+local function ensureSentinelSafe()
+    if not CONTROL.sentinelRequired then return true end
+
+    local ok, detail = readSentinel(
+        CONTROL.bus,
+        CONTROL.side,
+        CONTROL.sentinelSlot
+    )
+
+    if not ok then
+        return nil, detail
+    end
+
+    return true
+end
+
+local function enterMaintenanceMode()
+    if not CONTROL.bus then return true end
+
+    local safe, safeErr = ensureSentinelSafe()
+    if not safe then
+        return nil, safeErr
+    end
+
+    -- DRY RUN 本来就不会写总线，无需额外动作。
+    if CFG.dryRun then return true end
+
+    local ok, result = pcall(
+        applyStorageWhitelist,
+        CONTROL.bus,
+        CONTROL.side,
+        CONTROL.managedSlots,
+        {}
+    )
+
+    if not ok then
+        return nil, "进入维护模式失败: " .. tostring(result)
+    end
+
+    return true
+end
+
+-- ============================================================
 -- Dashboard / interaction
 -- ============================================================
 
@@ -1231,6 +1375,12 @@ local UI = {
     page = "targets",
     selectedTargetKey = nil,
     selectedMaterialKey = nil,
+
+    -- 长列表滚动位置；支持 OpenComputers scroll 事件。
+    targetOffset = 0,
+    cacheOffset = 0,
+    targetPageSize = 1,
+    cachePageSize = 1,
 }
 
 local COLORS = {
@@ -1566,6 +1716,11 @@ local function renderTargetPage(states, info)
     local rowY = headerY + 2
     local rowH = 3
     local maxRows = math.max(1, math.floor((h - rowY - 2 + 1) / rowH))
+    UI.targetPageSize = maxRows
+
+    local maxOffset = math.max(0, #states - maxRows)
+    UI.targetOffset = math.max(0, math.min(UI.targetOffset or 0, maxOffset))
+
     local materialW = math.max(18, math.floor(w * 0.31))
     local stockX = math.floor(w * 0.57)
     local rawX = math.floor(w * 0.77)
@@ -1573,12 +1728,18 @@ local function renderTargetPage(states, info)
 
     local selectedStillExists = false
 
-    for i = 1, math.min(#states, maxRows) do
-        local state = states[i]
+    for _, state in ipairs(states) do
         LAST_CONTEXT.targetByKey[state.target.key] = state
         if state.target.key == UI.selectedTargetKey then selectedStillExists = true end
+    end
 
-        local y = rowY + (i - 1) * rowH
+    local firstIndex = UI.targetOffset + 1
+    local lastIndex = math.min(#states, UI.targetOffset + maxRows)
+
+    for i = firstIndex, lastIndex do
+        local state = states[i]
+
+        local y = rowY + (i - firstIndex) * rowH
         local rawAmount = state.raw and state.raw.amount or 0
         local statusFg = statusColor(state.status)
         local selected = state.target.key == UI.selectedTargetKey
@@ -1606,9 +1767,19 @@ local function renderTargetPage(states, info)
     if UI.selectedTargetKey and not selectedStillExists then UI.selectedTargetKey = nil end
 
     local footerY = h
-    local leftFooter = #states > maxRows
-        and ("Showing " .. tostring(maxRows) .. " / " .. tostring(#states) .. " targets")
-        or ("自动刷新 " .. tostring(CFG.controlInterval or 3) .. "s · 点击[缓存]查看全部原矿")
+    local leftFooter
+    if #states > maxRows then
+        leftFooter = string.format(
+            "目标 %d-%d / %d · 鼠标滚轮上下浏览",
+            firstIndex,
+            lastIndex,
+            #states
+        )
+    else
+        leftFooter = "自动刷新 "
+            .. tostring(CFG.controlInterval or 3)
+            .. "s · 点击[缓存]查看全部原矿"
+    end
     gpuText(3, footerY, leftFooter, #states > maxRows and COLORS.amber or COLORS.muted, COLORS.bg)
 
     local rightFooter = USER.autoSurplusEnabled
@@ -1644,7 +1815,7 @@ local function renderCachePage(states, info)
     gpuFill(3, stripY, w - 4, 2, COLORS.panel2)
     gpuText(5, stripY, "默认 AUTO 阈值 " .. fmtAmount(USER.surplusHigh) .. " → " .. fmtAmount(USER.surplusLow), COLORS.muted, COLORS.panel2)
     gpuText(math.floor(w * 0.43), stripY, "未标记矿默认 " .. tostring(USER.defaultPolicy), COLORS.muted, COLORS.panel2)
-    gpuText(math.floor(w * 0.70), stripY, "VOID: v0.6 仅预留，不执行销毁", COLORS.amber, COLORS.panel2)
+    gpuText(math.floor(w * 0.70), stripY, "VOID: 仅显式逐矿允许；当前待独立销毁通道实机验证", COLORS.amber, COLORS.panel2)
     gpuText(5, stripY + 1, "点击矿物行选中；[策略]可设置 AUTO / IGNORE / VOID(预留) 及单矿阈值", COLORS.muted, COLORS.panel2)
 
     local headerY = 13
@@ -1667,15 +1838,26 @@ local function renderCachePage(states, info)
     local rowY = headerY + 2
     local rowH = 3
     local maxRows = math.max(1, math.floor((h - rowY - 2 + 1) / rowH))
+    UI.cachePageSize = maxRows
+
+    local maxOffset = math.max(0, #states - maxRows)
+    UI.cacheOffset = math.max(0, math.min(UI.cacheOffset or 0, maxOffset))
+
     local nameW = math.max(16, amountX - nameX - 2)
     local selectedStillExists = false
 
-    for i = 1, math.min(#states, maxRows) do
-        local s = states[i]
+    for _, s in ipairs(states) do
         LAST_CONTEXT.surplusByKey[s.key] = s
         if s.key == UI.selectedMaterialKey then selectedStillExists = true end
+    end
 
-        local y = rowY + (i - 1) * rowH
+    local firstIndex = UI.cacheOffset + 1
+    local lastIndex = math.min(#states, UI.cacheOffset + maxRows)
+
+    for i = firstIndex, lastIndex do
+        local s = states[i]
+
+        local y = rowY + (i - firstIndex) * rowH
         local selected = s.key == UI.selectedMaterialKey
         local rowBg = selected and COLORS.selected or ((i % 2 == 1) and COLORS.panel or COLORS.panel2)
         local pColor = policyColor(s.effectivePolicy)
@@ -1704,9 +1886,17 @@ local function renderCachePage(states, info)
     if UI.selectedMaterialKey and not selectedStillExists then UI.selectedMaterialKey = nil end
 
     local footerY = h
-    local leftFooter = #states > maxRows
-        and ("Showing " .. tostring(maxRows) .. " / " .. tostring(#states) .. " materials")
-        or "AUTO: 达到高阈值启动，开始后持续到低阈值；重启后保持状态"
+    local leftFooter
+    if #states > maxRows then
+        leftFooter = string.format(
+            "矿物 %d-%d / %d · 鼠标滚轮上下浏览",
+            firstIndex,
+            lastIndex,
+            #states
+        )
+    else
+        leftFooter = "AUTO: 达到高阈值启动，开始后持续到低阈值；重启后保持状态"
+    end
     gpuText(3, footerY, leftFooter, #states > maxRows and COLORS.amber or COLORS.muted, COLORS.bg)
 
     local rightFooter = USER.autoSurplusEnabled and "余矿自动加工 ACTIVE" or "余矿自动加工 PAUSED"
@@ -1742,6 +1932,16 @@ end
 -- ============================================================
 
 local function promptLine(title, promptText, currentValue)
+    local safe, safeErr = enterMaintenanceMode()
+    if not safe then
+        cleanupUI()
+        print("无法进入安全维护模式：")
+        print(tostring(safeErr))
+        print("按回车返回。")
+        io.read()
+        return nil
+    end
+
     cleanupUI()
     resetUIAfterPrompt()
 
@@ -1788,6 +1988,16 @@ local function editMaterialPolicy()
     local state = key and LAST_CONTEXT.surplusByKey[key]
     if not state then return end
 
+    local safe, safeErr = enterMaintenanceMode()
+    if not safe then
+        cleanupUI()
+        print("无法进入安全维护模式：")
+        print(tostring(safeErr))
+        print("按回车返回。")
+        io.read()
+        return
+    end
+
     local entry, policy, high, low = materialSetting(key)
 
     cleanupUI()
@@ -1799,7 +2009,7 @@ local function editMaterialPolicy()
     if state.target then print("注意：当前属于 TARGET；TARGET 会暂时覆盖这里设置的底层策略。") end
     print("A = AUTO 自动余矿加工")
     print("I = IGNORE 永久忽略")
-    print("V = VOID 过量销毁（v0.6 只记录策略，不会真的销毁）")
+    print("V = VOID 过量销毁（本版只记录策略；不会真的销毁）")
     print("当前策略: " .. policy)
     io.write("新策略 [A/I/V，回车保持]: ")
 
@@ -1898,6 +2108,21 @@ local function handleUIEvent(name, ...)
         return "exit"
     end
 
+    if name == "scroll" then
+        local _, x, y, direction = ...
+        direction = tonumber(direction) or 0
+
+        if UI.page == "cache" then
+            local step = direction > 0 and -1 or 1
+            UI.cacheOffset = math.max(0, (UI.cacheOffset or 0) + step)
+        else
+            local step = direction > 0 and -1 or 1
+            UI.targetOffset = math.max(0, (UI.targetOffset or 0) + step)
+        end
+
+        return "refresh"
+    end
+
     if name ~= "touch" then return nil end
 
     local _, x, y = ...
@@ -1937,6 +2162,30 @@ local function main()
     managedSlots = math.min(managedSlots, slotCount)
     if managedSlots < 1 then error("managedSlots 必须 > 0") end
 
+    local sentinelSlot, sentinelRequired =
+        resolveSentinelSlot(slotCount, managedSlots)
+
+    CONTROL.bus = bus
+    CONTROL.side = side
+    CONTROL.managedSlots = managedSlots
+    CONTROL.sentinelSlot = sentinelSlot
+    CONTROL.sentinelRequired = sentinelRequired
+
+    if sentinelRequired then
+        local sentinelOk, sentinelDetail =
+            readSentinel(bus, side, sentinelSlot)
+
+        if not sentinelOk and not CFG.dryRun then
+            error(
+                tostring(sentinelDetail)
+                .. "\nLIVE 模式拒绝启动，避免 Storage Bus 零过滤导致全矿放行。"
+            )
+        elseif not sentinelOk then
+            startupWarning = (startupWarning and (startupWarning .. " | ") or "")
+                .. tostring(sentinelDetail)
+        end
+    end
+
     print("GTNH Ore Dispatch Controller v" .. VERSION)
     print("配置: " .. tostring(loadedConfigPath))
     print("用户策略: " .. tostring(loadedUserPath))
@@ -1958,6 +2207,16 @@ local function main()
         local remaining = math.max(0, activeLimit - #targetSelected)
         local surplusSelected = chooseSurplusActive(surplusStates, seenRawItem, remaining)
         local selected = combineDispatch(targetSelected, surplusSelected)
+
+        -- 每轮写白名单前重新确认安全哨兵仍存在。
+        -- 玩家若误删占位符，LIVE 会立即停机而不是继续清空过滤槽。
+        if sentinelRequired and not CFG.dryRun then
+            local sentinelOk, sentinelDetail =
+                readSentinel(bus, side, sentinelSlot)
+            if not sentinelOk then
+                error(tostring(sentinelDetail))
+            end
+        end
 
         local changes = applyStorageWhitelist(bus, side, managedSlots, selected)
 
