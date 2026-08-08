@@ -1,4 +1,4 @@
--- GTNH Ore Dispatcher updater v0.4.1
+-- GTNH Ore Dispatcher updater v0.5.0
 local component = require("component")
 local filesystem = require("filesystem")
 local os = require("os")

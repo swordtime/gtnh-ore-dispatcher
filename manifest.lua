@@ -1,5 +1,5 @@
 return {
-    version = "0.4.1",
+    version = "0.5.0",
     rawBase = "https://raw.githubusercontent.com/swordtime/gtnh-ore-dispatcher/main/",
     files = {
         { remote = "ore_dispatcher.lua", localPath = "/home/ore_dispatcher.lua" },

@@ -1,4 +1,4 @@
--- GTNH Ore Dispatcher installer v0.4.1
+-- GTNH Ore Dispatcher installer v0.5.0
 local component = require("component")
 local filesystem = require("filesystem")
 local os = require("os")
@@ -51,7 +51,7 @@ if not component.isAvailable("internet") then
     error("未检测到 Internet Card，无法联网安装")
 end
 
-print("GTNH Ore Dispatcher Installer v0.4.1")
+print("GTNH Ore Dispatcher Installer v0.5.0")
 
 local ok, err =
     download(RAW_BASE .. "ore_update.lua", "/bin/ore-update.lua")

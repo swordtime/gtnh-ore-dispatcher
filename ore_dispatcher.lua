@@ -1,6 +1,6 @@
 -- GTNH 2.9 / OpenComputers
 -- GTNH Ore Dispatch Controller
--- Release v0.4.1
+-- Release v0.5.0
 --
 -- v0.4.1:
 --   UI-only major refresh. Core dispatch semantics remain v0.3.3-compatible.
@@ -14,8 +14,10 @@
 local component = require("component")
 local os = require("os")
 local term = require("term")
+local event = require("event")
+local computer = require("computer")
 
-local VERSION = "0.4.1"
+local VERSION = "0.5.0"
 
 local CONFIG_PATH = "/home/ore_dispatch_config.lua"
 local FALLBACK_CONFIG_PATH = "ore_dispatch_config.lua"
@@ -985,6 +987,15 @@ local UI = {
     color = false,
     w = 0,
     h = 0,
+
+    -- 保存启动前终端状态，退出按钮会恢复这些值。
+    originalW = nil,
+    originalH = nil,
+    originalFg = nil,
+    originalBg = nil,
+
+    -- 每次 render 时重建。后续新增按钮只需要往 BUTTONS 中注册。
+    buttonRegions = {},
 }
 
 local COLORS = {
@@ -1003,7 +1014,42 @@ local COLORS = {
     track       = 0x253039,
     black       = 0x000000,
     white       = 0xFFFFFF,
+    button      = 0x1C272D,
+    buttonHover = 0x26353D,
+    buttonOff   = 0x151A1D,
+    exitBg      = 0x5C1F27,
+    exitFg      = 0xFF9AA3,
 }
+
+-- 固定预留 3 个交互按钮槽。
+-- 目前：
+--   slot 1 = 命名（预留，后续接入物品重命名）
+--   slot 2 = 扩展（预留）
+--   slot 3 = 退出（已实现：退出 Dashboard，返回 OpenOS shell）
+--
+-- 后续新增功能不要重新设计点击系统，只需修改这里的 action/enabled。
+local BUTTONS = {
+    {
+        id = "rename",
+        label = "命名",
+        enabled = false,
+        kind = "normal",
+    },
+    {
+        id = "reserved",
+        label = "扩展",
+        enabled = false,
+        kind = "normal",
+    },
+    {
+        id = "exit",
+        label = "退出",
+        enabled = true,
+        kind = "exit",
+    },
+}
+
+local RUNNING = true
 
 local function sortForUI(states)
     table.sort(
@@ -1033,6 +1079,14 @@ local function uiInit()
     end
 
     local gpu = component.gpu
+
+    UI.originalW, UI.originalH = gpu.getResolution()
+
+    local okFg, fg = pcall(gpu.getForeground)
+    if okFg then UI.originalFg = fg end
+
+    local okBg, bg = pcall(gpu.getBackground)
+    if okBg then UI.originalBg = bg end
 
     if CFG.uiUseMaxResolution ~= false then
         local ok, mw, mh = pcall(gpu.maxResolution)
@@ -1144,11 +1198,144 @@ local function drawSolidBar(x, y, width, ratio)
     end
 end
 
+
+local function cleanupUI()
+    if not component.isAvailable("gpu") then
+        pcall(term.clear)
+        pcall(term.setCursor, 1, 1)
+        return
+    end
+
+    local gpu = component.gpu
+
+    if UI.originalW and UI.originalH then
+        pcall(gpu.setResolution, UI.originalW, UI.originalH)
+    end
+
+    if UI.originalBg then
+        pcall(gpu.setBackground, UI.originalBg)
+    else
+        pcall(gpu.setBackground, COLORS.black)
+    end
+
+    if UI.originalFg then
+        pcall(gpu.setForeground, UI.originalFg)
+    else
+        pcall(gpu.setForeground, COLORS.white)
+    end
+
+    pcall(term.clear)
+    pcall(term.setCursor, 1, 1)
+end
+
+local function registerButton(spec, x, y, w, h)
+    table.insert(
+        UI.buttonRegions,
+        {
+            id = spec.id,
+            label = spec.label,
+            enabled = spec.enabled,
+            kind = spec.kind,
+            x = x,
+            y = y,
+            w = w,
+            h = h,
+        }
+    )
+end
+
+local function drawButton(spec, x, y, w)
+    local bg = COLORS.buttonOff
+    local fg = COLORS.muted
+
+    if spec.enabled then
+        if spec.kind == "exit" then
+            bg = COLORS.exitBg
+            fg = COLORS.exitFg
+        else
+            bg = COLORS.button
+            fg = COLORS.text
+        end
+    end
+
+    gpuFill(x, y, w, 1, bg)
+
+    local labelW = displayWidth(spec.label)
+    local tx = x + math.max(0, math.floor((w - labelW) / 2))
+
+    gpuText(tx, y, spec.label, fg, bg)
+    registerButton(spec, x, y, w, 1)
+end
+
+local function hitButton(x, y)
+    for _, region in ipairs(UI.buttonRegions or {}) do
+        if x >= region.x
+           and x < region.x + region.w
+           and y >= region.y
+           and y < region.y + region.h
+        then
+            return region
+        end
+    end
+
+    return nil
+end
+
+local function handleUIEvent(name, ...)
+    if name == "interrupted" then
+        RUNNING = false
+        return "exit"
+    end
+
+    if name ~= "touch" then
+        return nil
+    end
+
+    local screenAddress, x, y, mouseButton, playerName = ...
+    local button = hitButton(tonumber(x) or -1, tonumber(y) or -1)
+
+    if not button or not button.enabled then
+        return nil
+    end
+
+    if button.id == "exit" then
+        RUNNING = false
+        return "exit"
+    end
+
+    -- rename / reserved 暂时仅占位。
+    -- 后续会在这里接入模态窗口、选择行、文本输入与 names.lua 持久化。
+    return button.id
+end
+
+local function waitForNextCycle(seconds)
+    local deadline = computer.uptime() + math.max(0, tonumber(seconds) or 0)
+
+    while RUNNING do
+        local remaining = deadline - computer.uptime()
+
+        if remaining <= 0 then
+            return
+        end
+
+        local pulled = {event.pull(remaining)}
+
+        if #pulled > 0 and pulled[1] ~= nil then
+            local name = table.remove(pulled, 1)
+            local action = handleUIEvent(name, table.unpack(pulled))
+
+            if action == "exit" then
+                return
+            end
+        end
+    end
+end
+
 local function renderTextFallback(states, info)
     pcall(term.clear)
     pcall(term.setCursor, 1, 1)
 
-    print("ORE PROCESSING CONTROL CENTER  v" .. VERSION)
+    print("矿石处理控制中心 / ORE PROCESSING CONTROL CENTER  v" .. VERSION)
     print(
         string.format(
             "%s | targets=%d active=%d | bus=%d/%d",
@@ -1192,20 +1379,39 @@ local function renderFancyUI(states, info)
     gpuFill(1, 1, w, 3, COLORS.panel)
     gpuFill(1, 4, w, 1, COLORS.greenDark)
 
-    gpuText(3, 1, "ORE PROCESSING CONTROL CENTER", COLORS.white, COLORS.panel)
+    gpuText(3, 1, "矿石处理控制中心", COLORS.white, COLORS.panel)
     gpuText(
         3,
         2,
-        "GTNH / AUTOMATED MATERIAL DISPATCH  ·  v" .. VERSION,
+        "ORE PROCESSING CONTROL CENTER  ·  GTNH  ·  v" .. VERSION,
         COLORS.muted,
         COLORS.panel
     )
+
+    UI.buttonRegions = {}
 
     local modeText = CFG.dryRun and "DRY RUN" or "LIVE"
     local modeBg = CFG.dryRun and 0x7A541A or 0x17633E
     local modeFg = CFG.dryRun and COLORS.amber or COLORS.green
     local modeW = displayWidth(modeText) + 2
-    drawBadge(w - modeW - 2, 2, modeText, modeFg, modeBg)
+    local modeX = w - modeW - 2
+    drawBadge(modeX, 2, modeText, modeFg, modeBg)
+
+    -- 右上角固定预留三个按钮槽。
+    -- 这样以后做“命名 / 设置 / 维护”等功能不需要再次挪整个 UI。
+    local buttonW = 8
+    local buttonGap = 1
+    local totalButtonW = buttonW * 3 + buttonGap * 2
+    local buttonX = modeX - totalButtonW - 2
+
+    for i, spec in ipairs(BUTTONS) do
+        drawButton(
+            spec,
+            buttonX + (i - 1) * (buttonW + buttonGap),
+            2,
+            buttonW
+        )
+    end
 
     -- Summary cards
     local gap = 2
@@ -1216,17 +1422,17 @@ local function renderFancyUI(states, info)
     local cy = 6
     local x = 3
 
-    drawCard(x, cy, cardW, "TARGETS", info.targetCount, COLORS.green)
+    drawCard(x, cy, cardW, "目标", info.targetCount, COLORS.green)
     x = x + cardW + gap
 
-    drawCard(x, cy, cardW, "ACTIVE", info.activeCount, COLORS.cyan)
+    drawCard(x, cy, cardW, "运行中", info.activeCount, COLORS.cyan)
     x = x + cardW + gap
 
     drawCard(
         x,
         cy,
         cardW,
-        "RAW TYPES",
+        "原矿种类",
         info.oreStackCount or 0,
         COLORS.amber
     )
@@ -1236,7 +1442,7 @@ local function renderFancyUI(states, info)
         x,
         cy,
         cardW,
-        "BUS SLOTS",
+        "总线槽位",
         tostring(info.managedSlots) .. "/" .. tostring(info.slotCount),
         COLORS.blue
     )
@@ -1246,7 +1452,7 @@ local function renderFancyUI(states, info)
         x,
         cy,
         math.max(12, w - x - 2),
-        "CHANGES",
+        "待同步",
         info.changes,
         info.changes > 0 and COLORS.amber or COLORS.green
     )
@@ -1258,7 +1464,7 @@ local function renderFancyUI(states, info)
     gpuText(
         5,
         stripY,
-        "PRODUCT " .. shortAddress(info.productAddress),
+        "成品网 " .. shortAddress(info.productAddress),
         COLORS.muted,
         COLORS.panel2
     )
@@ -1266,7 +1472,7 @@ local function renderFancyUI(states, info)
     gpuText(
         math.floor(w * 0.36),
         stripY,
-        "CACHE " .. shortAddress(info.cacheAddress),
+        "缓存网 " .. shortAddress(info.cacheAddress),
         COLORS.muted,
         COLORS.panel2
     )
@@ -1274,7 +1480,7 @@ local function renderFancyUI(states, info)
     gpuText(
         math.floor(w * 0.68),
         stripY,
-        "BUS " .. shortAddress(info.busAddress)
+        "存储总线 " .. shortAddress(info.busAddress)
             .. "  S" .. tostring(info.side),
         COLORS.muted,
         COLORS.panel2
@@ -1296,10 +1502,10 @@ local function renderFancyUI(states, info)
 
     -- Column headings
     local headerY = 13
-    gpuText(4, headerY, "MATERIAL", COLORS.muted, COLORS.bg)
-    gpuText(math.floor(w * 0.57), headerY, "STOCK", COLORS.muted, COLORS.bg)
-    gpuText(math.floor(w * 0.77), headerY, "RAW", COLORS.muted, COLORS.bg)
-    gpuText(w - 12, headerY, "STATE", COLORS.muted, COLORS.bg)
+    gpuText(4, headerY, "目标产物", COLORS.muted, COLORS.bg)
+    gpuText(math.floor(w * 0.57), headerY, "库存", COLORS.muted, COLORS.bg)
+    gpuText(math.floor(w * 0.77), headerY, "原矿缓存", COLORS.muted, COLORS.bg)
+    gpuText(w - 12, headerY, "状态", COLORS.muted, COLORS.bg)
 
     gpuFill(3, headerY + 1, w - 4, 1, COLORS.border)
 
@@ -1383,8 +1589,8 @@ local function renderFancyUI(states, info)
         )
 
         local rawLabel =
-            "RAW " .. fmtAmount(rawAmount)
-            .. "  ·  PRIORITY "
+            "原矿 " .. fmtAmount(rawAmount)
+            .. "  ·  优先级 "
             .. tostring(i)
 
         gpuText(
@@ -1415,7 +1621,7 @@ local function renderFancyUI(states, info)
         gpuText(
             3,
             footerY,
-            "AUTO REFRESH "
+            "自动刷新 "
                 .. tostring(CFG.controlInterval or 3)
                 .. "s",
             COLORS.muted,
@@ -1425,8 +1631,8 @@ local function renderFancyUI(states, info)
 
     local rightFooter =
         CFG.dryRun
-        and "SAFE MODE · Storage Bus writes disabled"
-        or "LIVE CONTROL · Storage Bus writes enabled"
+        and "安全模式 · Storage Bus 写入已禁用"
+        or "LIVE 控制 · Storage Bus 写入已启用"
 
     local rfW = displayWidth(rightFooter)
     gpuText(
@@ -1489,7 +1695,9 @@ local function main()
     print("启动完成，进入 Dashboard...")
     os.sleep(1)
 
-    while true do
+    RUNNING = true
+
+    while RUNNING do
         local targets, requestInfo = readTargets()
 
         local rawCatalog,
@@ -1541,8 +1749,11 @@ local function main()
             }
         )
 
-        os.sleep(tonumber(CFG.controlInterval) or 3)
+        waitForNextCycle(tonumber(CFG.controlInterval) or 3)
     end
+
+    cleanupUI()
+    return true
 end
 
 local ok, err = xpcall(
@@ -1556,13 +1767,7 @@ local ok, err = xpcall(
 )
 
 if not ok then
-    pcall(term.clear)
-
-    if component.isAvailable("gpu") then
-        pcall(component.gpu.setBackground, 0x000000)
-        pcall(component.gpu.setForeground, 0xFFFFFF)
-    end
-
+    cleanupUI()
     print("GTNH Ore Dispatch Controller 已停止")
     print(err)
 end

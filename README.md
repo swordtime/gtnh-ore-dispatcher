@@ -1,6 +1,6 @@
 # GTNH Ore Dispatcher
 
-Current release: **v0.4.1**
+Current release: **v0.5.0**
 
 ## v0.4.0 UI Refresh
 
@@ -81,3 +81,24 @@ Updating remains:
 ```sh
 ore-update
 ```
+
+
+## v0.5.0 Interactive UI foundation
+
+The dashboard now reserves three fixed touch-button slots in the upper-right corner:
+
+```text
+[ 命名 ] [ 扩展 ] [ 退出 ] [ LIVE ]
+```
+
+Current behavior:
+
+- `命名`: reserved, disabled for now.
+- `扩展`: reserved, disabled for now.
+- `退出`: active. Touching it exits the dashboard cleanly and returns to the OpenOS shell.
+
+The program now uses `event.pull()` between control cycles instead of a blind `os.sleep()`, so screen touches can be handled without stopping the dispatcher refresh loop.
+
+On exit the program restores the terminal resolution/colors it had before the dashboard started.
+
+This button registry is intentionally reusable. Future rename/settings/maintenance functions can attach to the existing slots without redesigning the dashboard geometry.
