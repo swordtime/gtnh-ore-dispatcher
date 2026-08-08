@@ -1,18 +1,16 @@
--- GTNH Ore Dispatcher updater v0.3.3
--- Repository: https://github.com/swordtime/gtnh-ore-dispatcher
-
+-- GTNH Ore Dispatcher updater v0.4.1
 local component = require("component")
 local filesystem = require("filesystem")
 local os = require("os")
 
 local RAW_BASE = "https://raw.githubusercontent.com/swordtime/gtnh-ore-dispatcher/main/"
 local MANIFEST_URL = RAW_BASE .. "manifest.lua"
-
 local VERSION_FILE = "/home/.ore_dispatcher_version"
 local TMP_MANIFEST = "/tmp/ore_dispatch_manifest.lua"
 
 local args = {...}
 local force = false
+
 for _, a in ipairs(args) do
     if a == "--force" or a == "-f" then
         force = true
@@ -37,12 +35,15 @@ end
 
 local function ensureParent(path)
     local parent = filesystem.path(path)
+
     if parent and parent ~= "" and not filesystem.exists(parent) then
         local ok, err = filesystem.makeDirectory(parent)
+
         if not ok and not filesystem.exists(parent) then
             return nil, err
         end
     end
+
     return true
 end
 
@@ -54,10 +55,14 @@ local function download(url, path)
         filesystem.remove(path)
     end
 
-    local result = os.execute(string.format('wget -f "%s" "%s"', url, path))
+    local result = os.execute(
+        string.format('wget -f "%s" "%s"', url, path)
+    )
+
     if not result or not filesystem.exists(path) then
         return nil, "wget 失败: " .. url
     end
+
     return true
 end
 
@@ -67,9 +72,11 @@ local function loadTable(path)
 
     local ok, data = pcall(fn)
     if not ok then return nil, data end
+
     if type(data) ~= "table" then
         return nil, "manifest 没有 return table"
     end
+
     return data
 end
 
@@ -84,46 +91,35 @@ if not component.isAvailable("internet") then
     return false
 end
 
-print("==============================================")
 print("GTNH Ore Dispatcher Updater")
-print("==============================================")
-print("正在读取远端 manifest...")
 
 local ok, err = download(MANIFEST_URL, TMP_MANIFEST)
 if not ok then error(err) end
 
-local manifest, manifestErr = loadTable(TMP_MANIFEST)
-if not manifest then
+local manifestData, manifestErr = loadTable(TMP_MANIFEST)
+if not manifestData then
     error("manifest 读取失败: " .. tostring(manifestErr))
 end
 
-if type(manifest.version) ~= "string" or type(manifest.files) ~= "table" then
-    error("manifest 格式错误")
-end
-
 local localVersion = readFirstLine(VERSION_FILE) or "未安装"
-print("本地版本: " .. localVersion)
-print("远端版本: " .. manifest.version)
 
-if not force and localVersion == manifest.version then
+print("本地版本: " .. localVersion)
+print("远端版本: " .. tostring(manifestData.version))
+
+if not force and localVersion == manifestData.version then
     print("已经是最新版本。")
     return true
 end
 
-local base = manifest.rawBase or RAW_BASE
+local base = manifestData.rawBase or RAW_BASE
 local staged = {}
 
-print("")
-print("正在下载更新文件...")
-
-for _, entry in ipairs(manifest.files) do
-    if type(entry.remote) ~= "string" or type(entry.localPath) ~= "string" then
-        error("manifest.files 项格式错误")
-    end
-
+for _, entry in ipairs(manifestData.files or {}) do
     local stage = entry.localPath .. ".new"
 
-    local downloadOk, downloadErr = download(base .. entry.remote, stage)
+    local downloadOk, downloadErr =
+        download(base .. entry.remote, stage)
+
     if not downloadOk then
         for _, s in ipairs(staged) do
             removeIfExists(s.stage)
@@ -139,9 +135,6 @@ for _, entry in ipairs(manifest.files) do
 
     print("  OK  " .. entry.remote)
 end
-
-print("")
-print("正在安装...")
 
 local committed = {}
 
@@ -163,6 +156,7 @@ end
 
 for _, e in ipairs(staged) do
     local parentOk, parentErr = ensureParent(e.target)
+
     if not parentOk then
         rollback()
         error("创建目录失败: " .. tostring(parentErr))
@@ -171,18 +165,23 @@ for _, e in ipairs(staged) do
     removeIfExists(e.backup)
 
     if filesystem.exists(e.target) then
-        local backupOk, backupErr = filesystem.rename(e.target, e.backup)
+        local backupOk, backupErr =
+            filesystem.rename(e.target, e.backup)
+
         if not backupOk then
             rollback()
             error("备份失败 " .. e.target .. ": " .. tostring(backupErr))
         end
     end
 
-    local installOk, installErr = filesystem.rename(e.stage, e.target)
+    local installOk, installErr =
+        filesystem.rename(e.stage, e.target)
+
     if not installOk then
         if filesystem.exists(e.backup) then
             filesystem.rename(e.backup, e.target)
         end
+
         rollback()
         error("安装失败 " .. e.target .. ": " .. tostring(installErr))
     end
@@ -190,24 +189,15 @@ for _, e in ipairs(staged) do
     table.insert(committed, e)
 end
 
-local versionOk, versionErr = writeText(
-    VERSION_FILE,
-    manifest.version .. "\n"
-)
+local versionOk, versionErr =
+    writeText(VERSION_FILE, tostring(manifestData.version) .. "\n")
 
 if not versionOk then
     rollback()
     error("写版本文件失败: " .. tostring(versionErr))
 end
 
-print("")
-print("更新完成: " .. localVersion .. " -> " .. manifest.version)
-print("本地用户配置不会被覆盖：")
-print("  /home/ore_dispatch_config.lua")
-print("  /home/ore_dispatch_overrides.lua")
-print("")
-print("最新版示例配置位于：")
-print("  /home/ore_dispatch_config.example.lua")
-print("  /home/ore_dispatch_overrides.example.lua")
+print("更新完成: " .. localVersion .. " -> " .. tostring(manifestData.version))
+print("本地 ore_dispatch_config.lua / overrides 不会被覆盖。")
 
 return true

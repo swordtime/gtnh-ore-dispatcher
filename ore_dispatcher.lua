@@ -1,49 +1,27 @@
 -- GTNH 2.9 / OpenComputers
 -- GTNH Ore Dispatch Controller
--- Release v0.3.3
+-- Release v0.4.1
 --
--- 专用成品网架构：
+-- v0.4.1:
+--   UI-only major refresh. Core dispatch semantics remain v0.3.3-compatible.
+--   - GPU-rendered dashboard
+--   - green solid progress bars (real background fill, not #)
+--   - status colors / LIVE badge / summary cards
+--   - dynamic large-screen layout + compact fallback
 --
---   请求器（最终产物目标）
---          |
---          v
---   [矿处成品网] <------ 集成矿石处理厂
---          ^                    ^
---          |                    |
---      主网消费             矿处处理网
---                               ^
---                               |
---                       OC 控制 Storage Bus
---                               ^
---                               |
---                        [原矿缓存网]
---
--- 核心逻辑：
--- 1) 自动扫描所有 level_maintainer，读取最终产物目标。
--- 2) productMeAddress 只读取“矿处成品网”中的目标库存。
--- 3) cacheMeAddress 扫描独立原矿缓存网。
--- 4) 用 OreDictionary 共同材料键自动关联：
---      dustBarium <-> Barium <-> oreBarium
---      gemRuby    <-> Ruby    <-> oreRuby
--- 5) 根据最终产物缺口选择当前需要处理的原矿。
--- 6) 用 setStorageConfiguration() 动态修改 me_storagebus 白名单。
--- 7) 支持多请求器、重复目标冲突保护、滞回控制、Dashboard。
---
--- v0.3 兼容 v0.2 本地配置：
--- 如果旧配置仍使用 mainMeAddress，程序会把它当作 productMeAddress 使用，
--- 但建议以后手动改名以免混淆。
+-- Existing /home/ore_dispatch_config.lua remains compatible.
 
 local component = require("component")
 local os = require("os")
 local term = require("term")
 
-local VERSION = "0.3.3"
+local VERSION = "0.4.1"
 
 local CONFIG_PATH = "/home/ore_dispatch_config.lua"
 local FALLBACK_CONFIG_PATH = "ore_dispatch_config.lua"
 
 -- ============================================================
--- 基础工具
+-- Config / basic utilities
 -- ============================================================
 
 local function loadLuaTable(path)
@@ -88,7 +66,6 @@ end
 
 local function normalizeMaterial(s)
     if type(s) ~= "string" then return nil end
-
     s = s:lower()
     s = s:gsub("[%s%p_]", "")
     return s
@@ -96,7 +73,6 @@ end
 
 local function itemId(item)
     if not item then return nil end
-
     return tostring(item.name) .. ":" .. tostring(item.damage or 0)
 end
 
@@ -110,18 +86,13 @@ end
 
 local function fmtAmount(n)
     n = tonumber(n) or 0
-
     local abs = math.abs(n)
 
     if abs >= 1000000000 then
         return string.format("%.2fG", n / 1000000000)
-    end
-
-    if abs >= 1000000 then
+    elseif abs >= 1000000 then
         return string.format("%.2fM", n / 1000000)
-    end
-
-    if abs >= 1000 then
+    elseif abs >= 1000 then
         return string.format("%.1fk", n / 1000)
     end
 
@@ -131,7 +102,6 @@ end
 local function shortAddress(address)
     address = tostring(address or "?")
     if #address <= 13 then return address end
-
     return address:sub(1, 8) .. "..." .. address:sub(-4)
 end
 
@@ -154,15 +124,19 @@ local function utf8Units(s)
         local ch = s:sub(i, math.min(#s, i + n - 1))
         local w = (b and b >= 192) and 2 or 1
 
-        table.insert(units, {
-            ch = ch,
-            width = w,
-        })
-
+        table.insert(units, {ch = ch, width = w})
         i = i + n
     end
 
     return units
+end
+
+local function displayWidth(s)
+    local width = 0
+    for _, u in ipairs(utf8Units(tostring(s or ""))) do
+        width = width + u.width
+    end
+    return width
 end
 
 local function fitText(s, width)
@@ -185,7 +159,6 @@ local function fitText(s, width)
 
     for _, u in ipairs(units) do
         if used + u.width > limit then break end
-
         table.insert(out, u.ch)
         used = used + u.width
     end
@@ -195,25 +168,21 @@ local function fitText(s, width)
         .. string.rep(" ", math.max(0, width - used - 3))
 end
 
-local function progressBar(ratio, width)
+local function progressText(ratio, width)
     width = width or 18
-
     local shown = clamp(ratio or 0, 0, 1)
     local full = math.floor(shown * width + 0.5)
-
     return "["
-        .. string.rep("#", full)
-        .. string.rep(".", width - full)
+        .. string.rep("=", full)
+        .. string.rep(" ", width - full)
         .. "]"
 end
 
 local function collectAddresses(typeName)
     local result = {}
-
     for address in component.list(typeName) do
         table.insert(result, address)
     end
-
     return result
 end
 
@@ -221,10 +190,7 @@ local function allMeAddresses()
     local result = {}
     local seen = {}
 
-    for _, componentType in ipairs({
-        "me_interface",
-        "fluid_interface",
-    }) do
+    for _, componentType in ipairs({"me_interface", "fluid_interface"}) do
         for _, address in ipairs(collectAddresses(componentType)) do
             if not seen[address] then
                 seen[address] = true
@@ -236,29 +202,10 @@ local function allMeAddresses()
     return result
 end
 
-local function requireProxy(address, role)
-    if not address then
-        error(role .. " 地址未配置")
-    end
-
-    local ok, proxy = pcall(component.proxy, address)
-
-    if not ok or not proxy then
-        error(role .. " 无法连接: " .. tostring(address))
-    end
-
-    return proxy
-end
-
-local function hasMethod(proxy, name)
-    return proxy and type(proxy[name]) == "function"
-end
-
 local function makeMeAdapter(address, role)
-    -- GTNH 2.9 / OC: component.methods()[method] may be false.
-    -- false means the method exists but is an indirect call; it is NOT absent.
     local methods = component.methods(address)
 
+    -- In GTNH OC, false means "indirect", not "missing".
     if not methods or methods.getItemsInNetwork == nil then
         error(role .. " 不提供 getItemsInNetwork()")
     end
@@ -275,36 +222,22 @@ local function validateConfig()
     local reopen = tonumber(CFG.reopenRatio) or 0.95
     local stop = tonumber(CFG.stopRatio) or 1.00
 
-    if reopen <= 0 then
-        error("reopenRatio 必须 > 0")
-    end
-
-    if stop <= 0 then
-        error("stopRatio 必须 > 0")
-    end
-
-    if reopen > stop then
-        error("reopenRatio 不能大于 stopRatio")
-    end
+    if reopen <= 0 then error("reopenRatio 必须 > 0") end
+    if stop <= 0 then error("stopRatio 必须 > 0") end
+    if reopen > stop then error("reopenRatio 不能大于 stopRatio") end
 
     local interval = tonumber(CFG.controlInterval) or 3
-    if interval < 1 then
-        error("controlInterval 建议至少为 1 秒")
-    end
+    if interval < 1 then error("controlInterval 建议至少为 1 秒") end
 
     local maxActive = tonumber(CFG.maxActive) or 12
-    if maxActive < 1 then
-        error("maxActive 必须 >= 1")
-    end
+    if maxActive < 1 then error("maxActive 必须 >= 1") end
 
     local requesterSlots = tonumber(CFG.requesterSlots) or 5
-    if requesterSlots < 1 then
-        error("requesterSlots 必须 >= 1")
-    end
+    if requesterSlots < 1 then error("requesterSlots 必须 >= 1") end
 end
 
 -- ============================================================
--- 网络 / Storage Bus 解析
+-- Network / Storage Bus
 -- ============================================================
 
 local function resolveStorageBus()
@@ -324,9 +257,6 @@ local function resolveStorageBus()
         address = buses[1]
     end
 
-    -- GTNH 2.9 下 me_storagebus 与 fluid_interface 一样，
-    -- methods 表中的布尔值表示 direct/indirect，而不是“是否存在”。
-    -- 因此这里只检查 key 是否存在，并统一通过 component.invoke 调用。
     local methods = component.methods(address)
 
     if not methods then
@@ -347,20 +277,11 @@ local function resolveStorageBus()
         address = address,
 
         getStorageSlotSize = function(side)
-            return component.invoke(
-                address,
-                "getStorageSlotSize",
-                side
-            )
+            return component.invoke(address, "getStorageSlotSize", side)
         end,
 
         getStorageConfiguration = function(side, slot)
-            return component.invoke(
-                address,
-                "getStorageConfiguration",
-                side,
-                slot
-            )
+            return component.invoke(address, "getStorageConfiguration", side, slot)
         end,
 
         setStorageConfiguration = function(side, slot, detail)
@@ -374,19 +295,11 @@ local function resolveStorageBus()
                 )
             end
 
-            if slot ~= nil then
-                return component.invoke(
-                    address,
-                    "setStorageConfiguration",
-                    side,
-                    slot
-                )
-            end
-
             return component.invoke(
                 address,
                 "setStorageConfiguration",
-                side
+                side,
+                slot
             )
         end,
     }
@@ -395,15 +308,9 @@ local function resolveStorageBus()
 
     if side == nil then
         for testSide = 0, 5 do
-            local ok, count = pcall(
-                bus.getStorageSlotSize,
-                testSide
-            )
+            local ok, count = pcall(bus.getStorageSlotSize, testSide)
 
-            if ok
-               and type(count) == "number"
-               and count > 0
-            then
+            if ok and type(count) == "number" and count > 0 then
                 side = testSide
                 break
             end
@@ -414,10 +321,7 @@ local function resolveStorageBus()
         error("无法自动识别 Storage Bus side")
     end
 
-    local ok, slotCount = pcall(
-        bus.getStorageSlotSize,
-        side
-    )
+    local ok, slotCount = pcall(bus.getStorageSlotSize, side)
 
     if not ok then
         error("Storage Bus side 无效: " .. tostring(side))
@@ -431,8 +335,6 @@ local function resolveStorageBus()
 end
 
 local function resolveMeNetworks()
-    -- v0.3 正式名称：productMeAddress
-    -- v0.2 兼容：mainMeAddress
     local productAddress = CFG.productMeAddress
     local legacyConfig = false
 
@@ -445,7 +347,6 @@ local function resolveMeNetworks()
 
     if not productAddress or not cacheAddress then
         local addresses = allMeAddresses()
-
         local lines = {
             "需要在 ore_dispatch_config.lua 指定：",
             "  productMeAddress = 成品网二合一接口 UUID",
@@ -465,16 +366,8 @@ local function resolveMeNetworks()
         error("productMeAddress 与 cacheMeAddress 不能相同")
     end
 
-    -- Use component.invoke for GTNH 2.9 fluid_interface indirect methods.
-    local productMe = makeMeAdapter(
-        productAddress,
-        "成品网 ME"
-    )
-
-    local cacheMe = makeMeAdapter(
-        cacheAddress,
-        "缓存网 ME"
-    )
+    local productMe = makeMeAdapter(productAddress, "成品网 ME")
+    local cacheMe = makeMeAdapter(cacheAddress, "缓存网 ME")
 
     return productMe, cacheMe, {
         productAddress = productAddress,
@@ -484,7 +377,7 @@ local function resolveMeNetworks()
 end
 
 -- ============================================================
--- 请求器
+-- Requesters
 -- ============================================================
 
 local function parseTargetItem(slotData)
@@ -518,9 +411,7 @@ local function parseTargetItem(slotData)
         target.damage = tonumber(slotData.damage)
     end
 
-    target.key = target.name
-        .. ":"
-        .. tostring(target.damage or 0)
+    target.key = target.name .. ":" .. tostring(target.damage or 0)
 
     return target
 end
@@ -542,11 +433,7 @@ local function readTargets()
         local methods = component.methods(address)
 
         if not methods or methods.getSlot == nil then
-            error(
-                "ME 请求器 "
-                .. tostring(address)
-                .. " 不提供 getSlot()"
-            )
+            error("ME 请求器 " .. tostring(address) .. " 不提供 getSlot()")
         end
 
         for slot = 1, slotsPerRequester do
@@ -590,7 +477,6 @@ local function readTargets()
                                 fmtAmount(target.goal)
                             )
                         )
-
                     else
                         duplicateCount = duplicateCount + 1
                     end
@@ -600,10 +486,7 @@ local function readTargets()
     end
 
     if requesterCount == 0 then
-        error(
-            "未检测到 level_maintainer；"
-            .. "本程序使用 ME 请求器保存最终产物目标"
-        )
+        error("未检测到 level_maintainer；本程序使用 ME 请求器保存最终产物目标")
     end
 
     if #conflicts > 0 then
@@ -622,22 +505,17 @@ local function readTargets()
 end
 
 -- ============================================================
--- 成品库存
+-- Product stock
 -- ============================================================
 
 local function getExactAmount(me, target)
-    local filter = {
-        name = target.name,
-    }
+    local filter = {name = target.name}
 
     if target.damage and target.damage > 0 then
         filter.damage = target.damage
     end
 
-    local ok, items = pcall(
-        me.getItemsInNetwork,
-        filter
-    )
+    local ok, items = pcall(me.getItemsInNetwork, filter)
 
     if not ok then
         return nil, nil, items
@@ -660,7 +538,7 @@ local function getExactAmount(me, target)
 end
 
 -- ============================================================
--- OreDictionary / 材料识别
+-- OreDictionary / material mapping
 -- ============================================================
 
 local TARGET_OREDICT_PREFIXES = {
@@ -668,11 +546,9 @@ local TARGET_OREDICT_PREFIXES = {
     "gemFlawless",
     "gemFlawed",
     "gemChipped",
-
     "dustTiny",
     "dustSmall",
     "dust",
-
     "gem",
     "ingot",
     "plate",
@@ -705,10 +581,7 @@ local function materialFromOreNames(oreNames)
             then
                 local material = oreName:sub(#prefix + 1)
 
-                return
-                    normalizeMaterial(material),
-                    material,
-                    oreName
+                return normalizeMaterial(material), material, oreName
             end
         end
     end
@@ -717,9 +590,7 @@ local function materialFromOreNames(oreNames)
 end
 
 local function materialFromLabel(label)
-    if type(label) ~= "string" then
-        return nil
-    end
+    if type(label) ~= "string" then return nil end
 
     local material = label
 
@@ -734,33 +605,16 @@ local function materialFromLabel(label)
         if #material > #suffix
            and material:sub(-#suffix) == suffix
         then
-            material = material:sub(
-                1,
-                #material - #suffix
-            )
+            material = material:sub(1, #material - #suffix)
             break
         end
     end
 
-    return
-        normalizeMaterial(material),
-        material,
-        "label-fallback"
+    return normalizeMaterial(material), material, "label-fallback"
 end
 
-
--- 原矿的 OreDictionary 在 GTNH 中可能编码宿主岩石：
---   oreEndstoneBarium
---   oreNetherrackBarium
--- 等。
--- 但实际物品 label 仍可能是 "Barium Ore"。
--- 因此原矿目录除了 OreDictionary key 之外，还额外用 label
--- 生成一个“纯材料名”别名，避免 Endstone/Netherrack 等前缀
--- 破坏 dustBarium <-> ore...Barium 的自动映射。
 local function materialFromRawOreLabel(label)
-    if type(label) ~= "string" then
-        return nil
-    end
+    if type(label) ~= "string" then return nil end
 
     local material = label:match("^(.-) Ore$")
 
@@ -768,41 +622,27 @@ local function materialFromRawOreLabel(label)
         return nil
     end
 
-    return
-        normalizeMaterial(material),
-        material,
-        "raw-label-fallback"
+    return normalizeMaterial(material), material, "raw-label-fallback"
 end
 
 -- ============================================================
--- 原矿缓存扫描
+-- Raw cache
 -- ============================================================
 
 local function getAllNetworkItems(me)
-    -- 第一优先：
-    -- GTNH 2.9 二合一接口的 getItemsInNetwork({})
-    local ok, items = pcall(
-        me.getItemsInNetwork,
-        {}
-    )
+    local ok, items = pcall(me.getItemsInNetwork, {})
 
     if ok and type(items) == "table" then
         return items
     end
 
-    -- 兼容回退：部分实现允许无参数。
-    ok, items = pcall(
-        me.getItemsInNetwork
-    )
+    ok, items = pcall(me.getItemsInNetwork)
 
     if ok and type(items) == "table" then
         return items
     end
 
-    error(
-        "无法扫描原矿缓存网全部物品: "
-        .. tostring(items)
-    )
+    error("无法扫描原矿缓存网全部物品: " .. tostring(items))
 end
 
 local function scanRawOreCatalog(cacheMe)
@@ -812,9 +652,7 @@ local function scanRawOreCatalog(cacheMe)
     local aliasCount = 0
 
     local function addAlias(key, material, stack, oreName)
-        if not key or key == "" then
-            return
-        end
+        if not key or key == "" then return end
 
         local row = catalog[key]
 
@@ -826,7 +664,6 @@ local function scanRawOreCatalog(cacheMe)
                 bestAmount = -1,
                 oreName = oreName,
             }
-
             catalog[key] = row
         end
 
@@ -834,9 +671,6 @@ local function scanRawOreCatalog(cacheMe)
 
         if (stack.size or 0) > row.bestAmount then
             row.bestAmount = stack.size or 0
-
-            -- setStorageConfiguration(detail)
-            -- 已由用户实机验证可写入。
             row.best = stack
             row.oreName = oreName
         end
@@ -848,45 +682,28 @@ local function scanRawOreCatalog(cacheMe)
         if stack and (stack.size or 0) > 0 then
             stackCount = stackCount + 1
 
-            -- 避免同一 ItemStack 因多个相同别名重复计数。
             local seenAliases = {}
             local matchedAsOre = false
 
-            -- 1) 保留 GTNH OreDictionary 原始 key。
-            --    例如 oreEndstoneBarium -> endstonebarium。
             for _, oreName in ipairs(stack.oreNames or {}) do
                 local material = oreName:match("^ore(.+)$")
 
                 if material then
                     matchedAsOre = true
-
                     local key = normalizeMaterial(material)
 
                     if key and not seenAliases[key] then
                         seenAliases[key] = true
-                        addAlias(
-                            key,
-                            material,
-                            stack,
-                            oreName
-                        )
+                        addAlias(key, material, stack, oreName)
                     end
                 end
             end
 
-            -- 2) 对被确认是矿石的 ItemStack，再从 label 建立纯材料别名。
-            --    你的 GTNH 2.9 实机例子：
-            --      oreNames={"oreEndstoneBarium"}
-            --      label="Barium Ore"
-            --    因此额外建立：
-            --      barium -> 该 Barium Ore ItemStack
             if matchedAsOre then
                 oreStackCount = oreStackCount + 1
 
-                local labelKey,
-                      labelMaterial = materialFromRawOreLabel(
-                          stack.label
-                      )
+                local labelKey, labelMaterial =
+                    materialFromRawOreLabel(stack.label)
 
                 if labelKey and not seenAliases[labelKey] then
                     seenAliases[labelKey] = true
@@ -909,55 +726,38 @@ local function scanRawOreCatalog(cacheMe)
 end
 
 -- ============================================================
--- 特殊覆盖
+-- Overrides
 -- ============================================================
 
 local function loadOverrides()
     local path = CFG.overrideFile
 
-    if not path then
-        return {}
-    end
+    if not path then return {} end
 
     local f = io.open(path, "r")
-
-    if not f then
-        return {}
-    end
-
+    if not f then return {} end
     f:close()
 
     local data, err = loadLuaTable(path)
 
     if not data then
-        error(
-            "例外映射文件读取失败: "
-            .. tostring(err)
-        )
+        error("例外映射文件读取失败: " .. tostring(err))
     end
 
     return data
 end
 
 -- ============================================================
--- 调度
+-- Dispatch state
 -- ============================================================
 
 local demandMemory = {}
 
-local function evaluateTargets(
-    productMe,
-    rawCatalog,
-    overrides,
-    targets
-)
+local function evaluateTargets(productMe, rawCatalog, overrides, targets)
     local states = {}
 
     for _, target in ipairs(targets) do
-        local current, exemplar, err = getExactAmount(
-            productMe,
-            target
-        )
+        local current, exemplar, err = getExactAmount(productMe, target)
 
         if current == nil then
             error(
@@ -969,41 +769,27 @@ local function evaluateTargets(
         end
 
         local ratio = 0
-
         if target.goal > 0 then
             ratio = current / target.goal
         end
 
-        -- 识别目标材料：
-        -- 1) 成品网现有 ItemStack 的 OreDictionary
-        -- 2) 请求器槽位数据中的 oreNames
-        -- 3) label 回退
         local materialKey = nil
         local materialName = nil
         local materialSource = nil
 
         if exemplar then
-            materialKey,
-            materialName,
-            materialSource = materialFromOreNames(
-                exemplar.oreNames
-            )
+            materialKey, materialName, materialSource =
+                materialFromOreNames(exemplar.oreNames)
         end
 
         if not materialKey and target.oreNames then
-            materialKey,
-            materialName,
-            materialSource = materialFromOreNames(
-                target.oreNames
-            )
+            materialKey, materialName, materialSource =
+                materialFromOreNames(target.oreNames)
         end
 
         if not materialKey then
-            materialKey,
-            materialName,
-            materialSource = materialFromLabel(
-                target.label
-            )
+            materialKey, materialName, materialSource =
+                materialFromLabel(target.label)
         end
 
         local raw = nil
@@ -1012,15 +798,10 @@ local function evaluateTargets(
             raw = rawCatalog[materialKey]
         end
 
-        -- 特殊覆盖只影响“该材料应该开放哪个原矿”。
         if materialKey and overrides[materialKey] then
             raw = {
                 material = materialName or materialKey,
-
-                -- 若缓存目录中能找到同材料，则沿用真实原矿总量。
-                -- 找不到时 amount=0，UI 会显示等待原矿。
                 amount = raw and raw.amount or 0,
-
                 best = overrides[materialKey],
                 bestAmount = raw and raw.amount or 0,
                 oreName = "override",
@@ -1032,10 +813,8 @@ local function evaluateTargets(
 
         if ratio >= (CFG.stopRatio or 1.0) then
             demanding = false
-
         elseif wasDemanding then
             demanding = true
-
         else
             demanding = ratio < (CFG.reopenRatio or 1.0)
         end
@@ -1044,16 +823,12 @@ local function evaluateTargets(
 
         table.insert(states, {
             target = target,
-
             current = current,
             ratio = ratio,
-
             materialKey = materialKey,
             materialName = materialName,
             materialSource = materialSource,
-
             raw = raw,
-
             demanding = demanding,
             selected = false,
             status = "",
@@ -1095,7 +870,6 @@ local function chooseActive(states, slotLimit)
                 return tostring(a.target.label)
                     < tostring(b.target.label)
             end
-
             return a.ratio < b.ratio
         end
     )
@@ -1107,18 +881,14 @@ local function chooseActive(states, slotLimit)
     local seenRawItem = {}
 
     for _, state in ipairs(candidates) do
-        if #selected >= limit then
-            break
-        end
+        if #selected >= limit then break end
 
         local id = itemId(state.raw.best)
 
         if id and not seenRawItem[id] then
             seenRawItem[id] = true
-
             state.selected = true
             state.status = "处理中"
-
             table.insert(selected, state)
         end
     end
@@ -1127,22 +897,14 @@ local function chooseActive(states, slotLimit)
 end
 
 -- ============================================================
--- Storage Bus 白名单
+-- Storage Bus whitelist
 -- ============================================================
 
-local function applyStorageWhitelist(
-    bus,
-    side,
-    managedSlots,
-    selected
-)
+local function applyStorageWhitelist(bus, side, managedSlots, selected)
     local desired = {}
 
     for _, state in ipairs(selected) do
-        table.insert(
-            desired,
-            state.raw.best
-        )
+        table.insert(desired, state.raw.best)
     end
 
     local changes = 0
@@ -1187,15 +949,11 @@ local function applyStorageWhitelist(
                     end
                 end
             end
-
         else
             if current ~= nil then
                 changes = changes + 1
 
                 if not CFG.dryRun then
-                    -- API 文档显示 descriptor 为可选参数。
-                    -- 无 descriptor 用于清空过滤槽。
-                    -- 正式 LIVE 前仍建议先完成一次实机清空测试。
                     local clearOk, result = pcall(
                         bus.setStorageConfiguration,
                         side,
@@ -1219,8 +977,33 @@ local function applyStorageWhitelist(
 end
 
 -- ============================================================
--- Dashboard
+-- Dashboard v0.4
 -- ============================================================
+
+local UI = {
+    initialized = false,
+    color = false,
+    w = 0,
+    h = 0,
+}
+
+local COLORS = {
+    bg          = 0x080B0D,
+    panel       = 0x10161A,
+    panel2      = 0x151D22,
+    border      = 0x263138,
+    text        = 0xDCE7EC,
+    muted       = 0x6F818A,
+    green       = 0x39D98A,
+    greenDark   = 0x173C2A,
+    cyan        = 0x55C7F3,
+    amber       = 0xFFB84D,
+    red         = 0xFF5C68,
+    blue        = 0x6B8CFF,
+    track       = 0x253039,
+    black       = 0x000000,
+    white       = 0xFFFFFF,
+}
 
 local function sortForUI(states)
     table.sort(
@@ -1241,111 +1024,446 @@ local function sortForUI(states)
     )
 end
 
-local function renderUI(states, info)
-    if CFG.enableUI == false then
+local function uiInit()
+    if UI.initialized then return end
+
+    if not component.isAvailable("gpu") then
+        UI.initialized = true
         return
     end
 
+    local gpu = component.gpu
+
+    if CFG.uiUseMaxResolution ~= false then
+        local ok, mw, mh = pcall(gpu.maxResolution)
+
+        if ok and type(mw) == "number" and type(mh) == "number" then
+            pcall(gpu.setResolution, mw, mh)
+        end
+    end
+
+    UI.w, UI.h = gpu.getResolution()
+
+    local okDepth, depth = pcall(gpu.getDepth)
+    UI.color = okDepth and type(depth) == "number" and depth > 1
+
+    UI.initialized = true
+end
+
+local function gpuColors(fg, bg)
+    if not component.isAvailable("gpu") then return end
+
+    if UI.color then
+        if fg then pcall(component.gpu.setForeground, fg) end
+        if bg then pcall(component.gpu.setBackground, bg) end
+    end
+end
+
+local function gpuSet(x, y, text, fg, bg)
+    if x < 1 or y < 1 or x > UI.w or y > UI.h then return end
+
+    gpuColors(fg, bg)
+
+    local max = UI.w - x + 1
+    if max <= 0 then return end
+
+    pcall(component.gpu.set, x, y, fitText(text, math.min(displayWidth(text), max)))
+end
+
+local function gpuText(x, y, text, fg, bg)
+    if x < 1 or y < 1 or x > UI.w or y > UI.h then return end
+    gpuColors(fg, bg)
+    pcall(component.gpu.set, x, y, tostring(text or ""))
+end
+
+local function gpuFill(x, y, w, h, bg)
+    if w <= 0 or h <= 0 then return end
+
+    if x < 1 then
+        w = w - (1 - x)
+        x = 1
+    end
+
+    if y < 1 then
+        h = h - (1 - y)
+        y = 1
+    end
+
+    w = math.min(w, UI.w - x + 1)
+    h = math.min(h, UI.h - y + 1)
+
+    if w <= 0 or h <= 0 then return end
+
+    gpuColors(COLORS.text, bg)
+    pcall(component.gpu.fill, x, y, w, h, " ")
+end
+
+local function statusColor(status)
+    if status == "已完成" then
+        return COLORS.green
+    elseif status == "处理中" then
+        return COLORS.cyan
+    elseif status == "等待原矿" then
+        return COLORS.amber
+    elseif status == "映射失败" then
+        return COLORS.red
+    elseif status == "待处理" then
+        return COLORS.blue
+    end
+
+    return COLORS.muted
+end
+
+local function drawBadge(x, y, text, fg, bg)
+    local width = displayWidth(text) + 2
+    gpuFill(x, y, width, 1, bg)
+    gpuText(x + 1, y, text, fg, bg)
+    return width
+end
+
+local function drawCard(x, y, w, label, value, accent)
+    gpuFill(x, y, w, 3, COLORS.panel)
+    gpuFill(x, y, 1, 3, accent)
+
+    gpuText(x + 3, y, label, COLORS.muted, COLORS.panel)
+    gpuText(x + 3, y + 1, tostring(value), COLORS.text, COLORS.panel)
+end
+
+local function drawSolidBar(x, y, width, ratio)
+    ratio = clamp(ratio or 0, 0, 1)
+    width = math.max(1, width)
+
+    -- Track is a real colored rectangle.
+    gpuFill(x, y, width, 1, COLORS.track)
+
+    local full = math.floor(width * ratio + 0.5)
+
+    if full > 0 then
+        -- User-requested green solid filled block.
+        gpuFill(x, y, full, 1, COLORS.green)
+    end
+end
+
+local function renderTextFallback(states, info)
     pcall(term.clear)
     pcall(term.setCursor, 1, 1)
 
-    print(
-        "GTNH Ore Dispatch Controller  v"
-        .. VERSION
-    )
-
+    print("ORE PROCESSING CONTROL CENTER  v" .. VERSION)
     print(
         string.format(
-            "成品网 %s | 缓存网 %s | %s",
-            shortAddress(info.productAddress),
-            shortAddress(info.cacheAddress),
-            CFG.dryRun and "[DRY RUN]" or "[LIVE]"
-        )
-    )
-
-    print(
-        string.format(
-            "StorageBus %s side=%d slots=%d managed=%d | 请求器=%d 目标=%d | active=%d changes=%d",
-            shortAddress(info.busAddress),
-            info.side,
-            info.slotCount,
-            info.managedSlots,
-            info.requesterCount,
+            "%s | targets=%d active=%d | bus=%d/%d",
+            CFG.dryRun and "[DRY RUN]" or "[LIVE]",
             info.targetCount,
             info.activeCount,
-            info.changes
+            info.managedSlots,
+            info.slotCount
         )
     )
-
-    if info.legacyConfig then
-        print(
-            "[兼容提示] 当前仍使用旧字段 mainMeAddress；"
-            .. "建议以后改名为 productMeAddress。"
-        )
-    else
-        print(
-            string.format(
-                "缓存扫描: 网络物品栈=%d 原矿匹配=%d 别名=%d | 重复目标=%d",
-                info.networkStackCount or 0,
-                info.oreStackCount or 0,
-                info.rawAliasCount or 0,
-                info.duplicateCount or 0
-            )
-        )
-    end
-
-    print(string.rep("=", 104))
-    print(
-        "目标产物                  当前 / 目标          进度                  原矿缓存      状态"
-    )
-    print(string.rep("-", 104))
+    print(string.rep("-", 96))
 
     sortForUI(states)
 
-    local maxRows = #states
+    for _, state in ipairs(states) do
+        local rawAmount = state.raw and state.raw.amount or 0
 
-    if component.isAvailable("gpu") then
-        local _, height = component.gpu.getResolution()
-        maxRows = math.max(1, height - 8)
-    end
-
-    for i = 1, math.min(#states, maxRows) do
-        local state = states[i]
-
-        local rawAmount = 0
-        if state.raw then
-            rawAmount = state.raw.amount or 0
-        end
-
-        local line = string.format(
-            "%s %8s / %-8s %s %6.1f%%  %10s  %s",
-            fitText(state.target.label, 24),
-            fmtAmount(state.current),
-            fmtAmount(state.target.goal),
-            progressBar(
-                state.ratio,
-                CFG.progressBarWidth or 18
-            ),
-            state.ratio * 100,
-            fmtAmount(rawAmount),
-            state.status
-        )
-
-        print(line)
-    end
-
-    if #states > maxRows then
         print(
             string.format(
-                "... 还有 %d 项未显示",
-                #states - maxRows
+                "%s %8s / %-8s %s %6.1f%% raw=%8s %s",
+                fitText(state.target.label, 22),
+                fmtAmount(state.current),
+                fmtAmount(state.target.goal),
+                progressText(state.ratio, CFG.progressBarWidth or 24),
+                state.ratio * 100,
+                fmtAmount(rawAmount),
+                state.status
             )
         )
     end
 end
 
+local function renderFancyUI(states, info)
+    local gpu = component.gpu
+    local w, h = UI.w, UI.h
+
+    -- Background
+    gpuFill(1, 1, w, h, COLORS.bg)
+
+    -- Header panel
+    gpuFill(1, 1, w, 3, COLORS.panel)
+    gpuFill(1, 4, w, 1, COLORS.greenDark)
+
+    gpuText(3, 1, "ORE PROCESSING CONTROL CENTER", COLORS.white, COLORS.panel)
+    gpuText(
+        3,
+        2,
+        "GTNH / AUTOMATED MATERIAL DISPATCH  ·  v" .. VERSION,
+        COLORS.muted,
+        COLORS.panel
+    )
+
+    local modeText = CFG.dryRun and "DRY RUN" or "LIVE"
+    local modeBg = CFG.dryRun and 0x7A541A or 0x17633E
+    local modeFg = CFG.dryRun and COLORS.amber or COLORS.green
+    local modeW = displayWidth(modeText) + 2
+    drawBadge(w - modeW - 2, 2, modeText, modeFg, modeBg)
+
+    -- Summary cards
+    local gap = 2
+    local cards = 5
+    local cardW = math.floor((w - 4 - gap * (cards - 1)) / cards)
+    cardW = math.max(12, cardW)
+
+    local cy = 6
+    local x = 3
+
+    drawCard(x, cy, cardW, "TARGETS", info.targetCount, COLORS.green)
+    x = x + cardW + gap
+
+    drawCard(x, cy, cardW, "ACTIVE", info.activeCount, COLORS.cyan)
+    x = x + cardW + gap
+
+    drawCard(
+        x,
+        cy,
+        cardW,
+        "RAW TYPES",
+        info.oreStackCount or 0,
+        COLORS.amber
+    )
+    x = x + cardW + gap
+
+    drawCard(
+        x,
+        cy,
+        cardW,
+        "BUS SLOTS",
+        tostring(info.managedSlots) .. "/" .. tostring(info.slotCount),
+        COLORS.blue
+    )
+    x = x + cardW + gap
+
+    drawCard(
+        x,
+        cy,
+        math.max(12, w - x - 2),
+        "CHANGES",
+        info.changes,
+        info.changes > 0 and COLORS.amber or COLORS.green
+    )
+
+    -- Network strip
+    local stripY = 10
+    gpuFill(3, stripY, w - 4, 2, COLORS.panel2)
+
+    gpuText(
+        5,
+        stripY,
+        "PRODUCT " .. shortAddress(info.productAddress),
+        COLORS.muted,
+        COLORS.panel2
+    )
+
+    gpuText(
+        math.floor(w * 0.36),
+        stripY,
+        "CACHE " .. shortAddress(info.cacheAddress),
+        COLORS.muted,
+        COLORS.panel2
+    )
+
+    gpuText(
+        math.floor(w * 0.68),
+        stripY,
+        "BUS " .. shortAddress(info.busAddress)
+            .. "  S" .. tostring(info.side),
+        COLORS.muted,
+        COLORS.panel2
+    )
+
+    gpuText(
+        5,
+        stripY + 1,
+        string.format(
+            "scan %d stacks · %d ores · %d aliases · %d requesters",
+            info.networkStackCount or 0,
+            info.oreStackCount or 0,
+            info.rawAliasCount or 0,
+            info.requesterCount or 0
+        ),
+        COLORS.muted,
+        COLORS.panel2
+    )
+
+    -- Column headings
+    local headerY = 13
+    gpuText(4, headerY, "MATERIAL", COLORS.muted, COLORS.bg)
+    gpuText(math.floor(w * 0.57), headerY, "STOCK", COLORS.muted, COLORS.bg)
+    gpuText(math.floor(w * 0.77), headerY, "RAW", COLORS.muted, COLORS.bg)
+    gpuText(w - 12, headerY, "STATE", COLORS.muted, COLORS.bg)
+
+    gpuFill(3, headerY + 1, w - 4, 1, COLORS.border)
+
+    sortForUI(states)
+
+    local rowY = headerY + 2
+    local rowH = 3
+    local footerRows = 2
+    local maxRows = math.max(
+        1,
+        math.floor((h - rowY - footerRows + 1) / rowH)
+    )
+
+    local materialW = math.max(18, math.floor(w * 0.31))
+    local stockX = math.floor(w * 0.57)
+    local rawX = math.floor(w * 0.77)
+    local stateX = w - 12
+
+    for i = 1, math.min(#states, maxRows) do
+        local state = states[i]
+        local y = rowY + (i - 1) * rowH
+        local rawAmount = state.raw and state.raw.amount or 0
+        local statusFg = statusColor(state.status)
+
+        -- Alternating dark card rows
+        local rowBg = (i % 2 == 1) and COLORS.panel or COLORS.panel2
+        gpuFill(3, y, w - 4, 2, rowBg)
+
+        -- Left accent indicates urgency/status, while progress remains green.
+        gpuFill(3, y, 1, 2, statusFg)
+
+        gpuText(
+            5,
+            y,
+            fitText(state.target.label, materialW),
+            COLORS.text,
+            rowBg
+        )
+
+        gpuText(
+            stockX,
+            y,
+            fmtAmount(state.current)
+                .. " / "
+                .. fmtAmount(state.target.goal),
+            state.ratio >= 1 and COLORS.green or COLORS.text,
+            rowBg
+        )
+
+        gpuText(
+            rawX,
+            y,
+            fmtAmount(rawAmount),
+            rawAmount > 0 and COLORS.text or COLORS.amber,
+            rowBg
+        )
+
+        gpuText(
+            stateX,
+            y,
+            state.status,
+            statusFg,
+            rowBg
+        )
+
+        -- Premium solid progress bar.
+        local barX = 5
+        local percentText = string.format("%5.1f%%", state.ratio * 100)
+        local percentW = displayWidth(percentText)
+        local barRight = stockX - 3
+        local barW = math.max(12, barRight - barX - percentW - 2)
+
+        drawSolidBar(barX, y + 1, barW, state.ratio)
+
+        gpuText(
+            barX + barW + 2,
+            y + 1,
+            percentText,
+            state.ratio >= 1 and COLORS.green or COLORS.muted,
+            rowBg
+        )
+
+        local rawLabel =
+            "RAW " .. fmtAmount(rawAmount)
+            .. "  ·  PRIORITY "
+            .. tostring(i)
+
+        gpuText(
+            stockX,
+            y + 1,
+            rawLabel,
+            COLORS.muted,
+            rowBg
+        )
+    end
+
+    -- Footer
+    local footerY = h
+
+    if #states > maxRows then
+        gpuText(
+            3,
+            footerY,
+            "Showing "
+                .. tostring(maxRows)
+                .. " / "
+                .. tostring(#states)
+                .. " targets",
+            COLORS.amber,
+            COLORS.bg
+        )
+    else
+        gpuText(
+            3,
+            footerY,
+            "AUTO REFRESH "
+                .. tostring(CFG.controlInterval or 3)
+                .. "s",
+            COLORS.muted,
+            COLORS.bg
+        )
+    end
+
+    local rightFooter =
+        CFG.dryRun
+        and "SAFE MODE · Storage Bus writes disabled"
+        or "LIVE CONTROL · Storage Bus writes enabled"
+
+    local rfW = displayWidth(rightFooter)
+    gpuText(
+        math.max(3, w - rfW - 2),
+        footerY,
+        rightFooter,
+        CFG.dryRun and COLORS.amber or COLORS.green,
+        COLORS.bg
+    )
+
+    -- Restore sane terminal colors for any later error text.
+    gpuColors(COLORS.text, COLORS.bg)
+end
+
+local function renderUI(states, info)
+    if CFG.enableUI == false then return end
+
+    uiInit()
+
+    if not component.isAvailable("gpu") then
+        renderTextFallback(states, info)
+        return
+    end
+
+    UI.w, UI.h = component.gpu.getResolution()
+
+    -- Fancy UI needs enough room. Smaller screens fall back safely.
+    if not UI.color or UI.w < 90 or UI.h < 20 then
+        renderTextFallback(states, info)
+        return
+    end
+
+    renderFancyUI(states, info)
+end
+
 -- ============================================================
--- 主循环
+-- Main loop
 -- ============================================================
 
 local function main()
@@ -1360,47 +1478,15 @@ local function main()
 
     local managedSlots = CFG.managedSlots or slotCount
     managedSlots = tonumber(managedSlots) or slotCount
-    managedSlots = math.min(
-        managedSlots,
-        slotCount
-    )
+    managedSlots = math.min(managedSlots, slotCount)
 
     if managedSlots < 1 then
         error("managedSlots 必须 > 0")
     end
 
-    print("==============================================")
     print("GTNH Ore Dispatch Controller v" .. VERSION)
-    print("==============================================")
     print("配置: " .. tostring(loadedConfigPath))
-    print(
-        "成品网: "
-        .. tostring(meInfo.productAddress)
-    )
-    print(
-        "缓存网: "
-        .. tostring(meInfo.cacheAddress)
-    )
-    print(
-        "Storage Bus: "
-        .. tostring(busAddress)
-        .. " side="
-        .. tostring(side)
-        .. " slots="
-        .. tostring(slotCount)
-    )
-    print(
-        "模式: "
-        .. (CFG.dryRun and "DRY RUN" or "LIVE")
-    )
-
-    if meInfo.legacyConfig then
-        print(
-            "提示: 旧配置 mainMeAddress 已自动兼容为 productMeAddress"
-        )
-    end
-
-    print("启动完成，开始调度...")
+    print("启动完成，进入 Dashboard...")
     os.sleep(1)
 
     while true do
@@ -1455,9 +1541,7 @@ local function main()
             }
         )
 
-        os.sleep(
-            tonumber(CFG.controlInterval) or 3
-        )
+        os.sleep(tonumber(CFG.controlInterval) or 3)
     end
 end
 
@@ -1467,13 +1551,18 @@ local ok, err = xpcall(
         if debug and debug.traceback then
             return debug.traceback(e, 2)
         end
-
         return tostring(e)
     end
 )
 
 if not ok then
     pcall(term.clear)
+
+    if component.isAvailable("gpu") then
+        pcall(component.gpu.setBackground, 0x000000)
+        pcall(component.gpu.setForeground, 0xFFFFFF)
+    end
+
     print("GTNH Ore Dispatch Controller 已停止")
     print(err)
 end
